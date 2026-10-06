@@ -1,0 +1,135 @@
+{
+  "format": "docx",
+  "verdict": "pass",
+  "checks": [
+    {
+      "id": "package",
+      "status": "pass"
+    },
+    {
+      "id": "contains",
+      "status": "pass",
+      "text": "Q100"
+    },
+    {
+      "id": "contains",
+      "status": "pass",
+      "text": "Q150"
+    },
+    {
+      "id": "contains",
+      "status": "pass",
+      "text": "\u5206\u6863\u8bc4\u5206\u7ec6\u5219"
+    },
+    {
+      "id": "contains",
+      "status": "pass",
+      "text": "\u73b0\u573a\u4ee3\u7801\u9898"
+    },
+    {
+      "id": "contains",
+      "status": "pass",
+      "text": "\u5206\u65b9\u5411\u9762\u8bd5\u5377\u7ec4\u5408"
+    },
+    {
+      "id": "contains",
+      "status": "pass",
+      "text": "def nms"
+    },
+    {
+      "id": "contains",
+      "status": "pass",
+      "text": "def otsu"
+    }
+  ],
+  "summary": {
+    "paragraphs": 2983,
+    "tables": [
+      {
+        "rows": 16,
+        "columns": 4
+      },
+      {
+        "rows": 6,
+        "columns": 3
+      },
+      {
+        "rows": 7,
+        "columns": 3
+      },
+      {
+        "rows": 6,
+        "columns": 4
+      },
+      {
+        "rows": 5,
+        "columns": 4
+      },
+      {
+        "rows": 6,
+        "columns": 3
+      },
+      {
+        "rows": 7,
+        "columns": 3
+      },
+      {
+        "rows": 6,
+        "columns": 3
+      },
+      {
+        "rows": 6,
+        "columns": 5
+      },
+      {
+        "rows": 7,
+        "columns": 4
+      },
+      {
+        "rows": 13,
+        "columns": 4
+      },
+      {
+        "rows": 51,
+        "columns": 3
+      },
+      {
+        "rows": 5,
+        "columns": 3
+      },
+      {
+        "rows": 6,
+        "columns": 4
+      },
+      {
+        "rows": 5,
+        "columns": 4
+      },
+      {
+        "rows": 6,
+        "columns": 4
+      },
+      {
+        "rows": 4,
+        "columns": 4
+      }
+    ],
+    "sections": [
+      {
+        "page_twips": {
+          "w": "12240",
+          "h": "15840"
+        },
+        "margins_twips": {
+          "top": "1200",
+          "right": "1120",
+          "bottom": "1200",
+          "left": "1120",
+          "header": "720",
+          "footer": "720",
+          "gutter": "0"
+        }
+      }
+    ]
+  }
+}
