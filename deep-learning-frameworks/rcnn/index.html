@@ -1,0 +1,1166 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>R-CNN 逐步详解 · 从候选框到最终检测结果</title>
+<meta name="description" content="R-CNN 的每一步细节：Selective Search 生成约 2000 个候选框、warp 到 227×227、AlexNet 前向取 fc7、逐类线性 SVM 打分、边框回归精修、类内贪心 NMS。含 9 个可交互演示与完整超参数。">
+<link rel="stylesheet" href="../assets/styles.css">
+</head>
+<body>
+<div id="progress"></div>
+
+<div class="topbar">
+  <div class="brand">R-CNN <span>逐步详解</span></div>
+  <nav id="topnav">
+    <a href="#s1">总览</a>
+    <a href="#s2">① 候选框</a>
+    <a href="#s3">② 归一化</a>
+    <a href="#s4">③ CNN 特征</a>
+    <a href="#s5">④ SVM</a>
+    <a href="#s6">⑤ 边框回归</a>
+    <a href="#s7">训练</a>
+    <a href="#s8">推理</a>
+    <a href="#s9">NMS</a>
+    <a href="#s10">速查</a>
+  </nav>
+</div>
+
+<div class="wrap">
+  <aside class="toc">
+    <h4>本页目录</h4>
+    <ol id="tocList">
+      <li><a href="#s1">R-CNN 到底做了什么</a></li>
+      <li><a href="#s2">第 1 步 · 候选区域生成</a></li>
+      <li><a href="#s3">第 2 步 · 区域归一化到 227×227</a></li>
+      <li><a href="#s4">第 3 步 · CNN 前向提取 fc7</a></li>
+      <li><a href="#s5">第 4 步 · 逐类线性 SVM 打分</a></li>
+      <li><a href="#s6">第 5 步 · 边框回归精修</a></li>
+      <li><a href="#s7">训练流程：四个阶段与全部超参</a></li>
+      <li><a href="#s8">推理流程：单步拆解与计时</a></li>
+      <li><a href="#s9">第 6 步 · NMS 与输出格式</a></li>
+      <li><a href="#s10">速查表与 FAQ</a></li>
+      <li><a href="#s11">代码实战</a></li>
+      <li><a href="#s12">自测题</a></li>
+    </ol>
+  </aside>
+
+  <main>
+    <header class="hero">
+      <span class="kicker">R-CNN · GIRSHICK ET AL., CVPR 2014</span>
+      <h1>R-CNN <em>逐步详解</em></h1>
+      <p class="sub">
+        本页只讲 R-CNN 一个模型，但把<strong>每一步的输入、输出、张量尺寸、超参数、公式与耗时</strong>全部写清楚。
+        读完之后你应该能做到：不看代码就完整复述一遍推理流程；能解释每个超参数为什么取那个值；
+        能手推一次 IoU、NMS、边框回归的编码与解码。
+      </p>
+      <div class="meta">
+        <span>6 个步骤</span>
+        <span>9 个交互演示</span>
+        <span>VOC2010 mAP 53.7%</span>
+        <span>2000 候选框 / 图</span>
+      </div>
+    </header>
+
+    <!-- ================= 1 ================= -->
+    <section id="s1">
+      <h2><span class="num">01</span>R-CNN 到底做了什么</h2>
+      <p class="lead">
+        一句话：<strong>先在图上猜出约 2000 个「可能有东西」的框，再把每个框抠出来缩成 227×227 送进 CNN，
+        用 CNN 特征让 SVM 判断类别、让回归器修正位置，最后用 NMS 去掉重复框</strong>。
+        整个模型没有端到端训练，是三个独立模块串起来的。
+      </p>
+
+      <figure>
+        <svg viewBox="0 0 1140 330" role="img" aria-label="R-CNN 六步流程图">
+          <defs>
+            <marker id="fa" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="#4cc9f0"></path>
+            </marker>
+            <linearGradient id="fg1" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#1b2a52"></stop><stop offset="1" stop-color="#111a35"></stop></linearGradient>
+          </defs>
+
+          <g font-size="13">
+            <!-- 输入 -->
+            <rect x="14" y="70" width="150" height="150" rx="12" fill="url(#fg1)" stroke="#26304f"></rect>
+            <text x="89" y="96" text-anchor="middle" fill="#e8edf9" font-size="14" font-weight="600">输入图像</text>
+            <rect x="38" y="110" width="46" height="90" rx="5" fill="rgba(61,220,151,.18)" stroke="#3ddc97" stroke-width="1.5"></rect>
+            <rect x="92" y="140" width="52" height="44" rx="5" fill="rgba(255,180,84,.18)" stroke="#ffb454" stroke-width="1.5"></rect>
+            <text x="89" y="212" text-anchor="middle" fill="#7c88a8" font-size="11.5">任意尺寸</text>
+
+            <!-- 6 步卡片 -->
+            <g>
+              <rect x="196" y="70" width="140" height="150" rx="12" fill="url(#fg1)" stroke="#2b65a0"></rect>
+              <text x="266" y="98" text-anchor="middle" fill="#4cc9f0" font-weight="700">① 候选区域</text>
+              <text x="266" y="122" text-anchor="middle" fill="#aab6d4" font-size="11.5">Selective Search</text>
+              <text x="266" y="144" text-anchor="middle" fill="#e8edf9" font-size="15" font-weight="600">~2000 个框</text>
+              <text x="266" y="168" text-anchor="middle" fill="#7c88a8" font-size="11">与类别无关</text>
+              <text x="266" y="190" text-anchor="middle" fill="#ffb454" font-size="11">占比 &lt;5% 耗时</text>
+
+              <rect x="366" y="70" width="140" height="150" rx="12" fill="url(#fg1)" stroke="#2b65a0"></rect>
+              <text x="436" y="98" text-anchor="middle" fill="#4cc9f0" font-weight="700">② 区域归一化</text>
+              <text x="436" y="122" text-anchor="middle" fill="#aab6d4" font-size="11.5">warp + padding</text>
+              <text x="436" y="144" text-anchor="middle" fill="#e8edf9" font-size="15" font-weight="600">227×227×3</text>
+              <text x="436" y="168" text-anchor="middle" fill="#7c88a8" font-size="11">p=16 均值填充</text>
+              <text x="436" y="190" text-anchor="middle" fill="#7c88a8" font-size="11">各向异性缩放</text>
+
+              <rect x="536" y="70" width="140" height="150" rx="12" fill="url(#fg1)" stroke="#2b65a0"></rect>
+              <text x="606" y="98" text-anchor="middle" fill="#4cc9f0" font-weight="700">③ CNN 前向</text>
+              <text x="606" y="122" text-anchor="middle" fill="#aab6d4" font-size="11.5">AlexNet</text>
+              <text x="606" y="144" text-anchor="middle" fill="#e8edf9" font-size="15" font-weight="600">fc7 = 4096 维</text>
+              <text x="606" y="168" text-anchor="middle" fill="#7c88a8" font-size="11">pool5 = 6×6×256</text>
+              <text x="606" y="190" text-anchor="middle" fill="#ff6b81" font-size="11">≈95% 耗时</text>
+
+              <rect x="706" y="70" width="140" height="150" rx="12" fill="url(#fg1)" stroke="#2b65a0"></rect>
+              <text x="776" y="98" text-anchor="middle" fill="#4cc9f0" font-weight="700">④ SVM 打分</text>
+              <text x="776" y="122" text-anchor="middle" fill="#aab6d4" font-size="11.5">21 个二分类器</text>
+              <text x="776" y="144" text-anchor="middle" fill="#e8edf9" font-size="15" font-weight="600">20 类 + 背景</text>
+              <text x="776" y="168" text-anchor="middle" fill="#7c88a8" font-size="11">难例挖掘训练</text>
+              <text x="776" y="190" text-anchor="middle" fill="#7c88a8" font-size="11">每类一个 w</text>
+
+              <rect x="876" y="70" width="130" height="150" rx="12" fill="url(#fg1)" stroke="#2b65a0"></rect>
+              <text x="941" y="98" text-anchor="middle" fill="#4cc9f0" font-weight="700">⑤ 边框回归</text>
+              <text x="941" y="122" text-anchor="middle" fill="#aab6d4" font-size="11.5">输入 pool5</text>
+              <text x="941" y="144" text-anchor="middle" fill="#e8edf9" font-size="14" font-weight="600">4 个偏移量</text>
+              <text x="941" y="168" text-anchor="middle" fill="#7c88a8" font-size="11">逐类回归</text>
+              <text x="941" y="190" text-anchor="middle" fill="#7c88a8" font-size="11">IoU≥0.6 训练</text>
+
+              <rect x="1030" y="70" width="96" height="150" rx="12" fill="url(#fg1)" stroke="#b57bff"></rect>
+              <text x="1078" y="98" text-anchor="middle" fill="#b57bff" font-weight="700">⑥ NMS</text>
+              <text x="1078" y="122" text-anchor="middle" fill="#aab6d4" font-size="11.5">贪心抑制</text>
+              <text x="1078" y="144" text-anchor="middle" fill="#e8edf9" font-size="15" font-weight="600">IoU 0.3</text>
+              <text x="1078" y="168" text-anchor="middle" fill="#7c88a8" font-size="11">类内去重</text>
+              <text x="1078" y="190" text-anchor="middle" fill="#7c88a8" font-size="11">最终结果</text>
+            </g>
+
+            <g stroke="#4cc9f0" stroke-width="1.8" marker-end="url(#fa)">
+              <line x1="168" y1="145" x2="192" y2="145"></line>
+              <line x1="339" y1="145" x2="362" y2="145"></line>
+              <line x1="509" y1="145" x2="532" y2="145"></line>
+              <line x1="679" y1="145" x2="702" y2="145"></line>
+              <line x1="849" y1="145" x2="872" y2="145"></line>
+              <line x1="1009" y1="145" x2="1026" y2="145"></line>
+            </g>
+
+            <text x="14" y="252" fill="#7c88a8" font-size="12">阶段①②不可学习；③可微调；④⑤⑥是各自独立训练的线性模型 / 后处理。整条链路没有梯度贯通 → 无法端到端训练。</text>
+            <text x="14" y="276" fill="#3ddc97" font-size="12">这 6 步里，第 ③ 步吃掉约 95% 的时间，第 ① 步的召回率决定了整条链路的性能上限。</text>
+          </g>
+        </svg>
+        <figcaption>图 1-1　R-CNN 完整流程。本页第 2~6 节逐步拆解，第 7~9 节讲训练、推理与后处理</figcaption>
+      </figure>
+
+      <h3>1.1 完整流程的输入输出规格（先建立全局印象）</h3>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>步骤</th><th>输入</th><th>输出</th><th>关键参数</th></tr></thead>
+          <tbody>
+            <tr><td>① 候选区域</td><td>RGB 图像，任意尺寸（论文短边缩放到 500 或 600）</td><td>约 2000 个 (x, y, w, h)，与类别无关</td><td>按分数排序截断 K=2000</td></tr>
+            <tr><td>② 区域归一化</td><td>原图 + 单个候选框</td><td>3×227×227 的 patch</td><td>各向异性缩放，外围补 p=16 像素均值</td></tr>
+            <tr><td>③ CNN 前向</td><td>3×227×227</td><td>pool5（6×6×256 = 9216 维）、fc7（4096 维）</td><td>AlexNet 权重（ImageNet 预训练 + 域内微调）</td></tr>
+            <tr><td>④ SVM 打分</td><td>fc7，4096 维</td><td>21 个分数（20 类 + 背景）</td><td>每类一个线性 SVM，C 用验证集调</td></tr>
+            <tr><td>⑤ 边框回归</td><td>pool5，9216 维</td><td>每类 4 个偏移量 (d<sub>x</sub>, d<sub>y</sub>, d<sub>w</sub>, d<sub>h</sub>)</td><td>岭回归，λ=1000，只用 IoU≥0.6 的样本</td></tr>
+            <tr><td>⑥ NMS</td><td>所有框 + 分数</td><td>最终检测框</td><td>类内贪心，IoU 阈值 0.3</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout">
+        <span class="t">为什么值得一步步抠细节</span>
+        <p>因为 R-CNN 的所有后续改进都精确对应这里的某一处缺陷：
+        <strong>第 ③ 步重复计算</strong> → Fast R-CNN 的 RoI Pooling；
+        <strong>第 ④⑤ 步割裂</strong> → 多任务联合损失；
+        <strong>第 ① 步不可学习</strong> → Faster R-CNN 的 RPN。
+        把每一步看透，后面三代模型的每个设计都会变得理所当然。</p>
+      </div>
+    </section>
+
+    <!-- ================= 2 ================= -->
+    <section id="s2">
+      <h2><span class="num">02</span>第 1 步 · 候选区域生成（Selective Search）</h2>
+      <p class="lead">
+        这一步的任务：<strong>不看类别，在图上找出约 2000 个「可能有物体」的框，并保证几乎不漏物体</strong>。
+        它没有任何可学习参数，纯 CPU 算法，论文用的是 Uijlings 等人 2013 年的 Selective Search。
+      </p>
+
+      <h3>2.1 算法细节：从超像素到候选框</h3>
+      <ol>
+        <li>
+          <strong>初始过分割</strong>：用 Felzenszwalb &amp; Huttenlocher 的图分割算法（基于图论的高效分割）把图像切成大量小区域，
+          通常得到 <strong>1000~2000 个超像素块</strong>。这一步只依赖像素颜色相似度与边缘，不涉及语义。
+        </li>
+        <li>
+          <strong>为每个区域计算特征描述子</strong>：
+          <ul>
+            <li>颜色：对每个颜色通道取 <strong>25 个 bin 的直方图</strong>，得到 75 维（RGB 三通道）；</li>
+            <li>纹理：用类 SIFT 的梯度方向直方图，<strong>8 个方向 × 10 个 bin = 80 维</strong>。</li>
+          </ul>
+        </li>
+        <li>
+          <strong>计算相邻区域对的四种相似度</strong>：
+          <ul>
+            <li><code>s_color</code>：颜色直方图的<strong>交集</strong>（sum of min），越大越相似；</li>
+            <li><code>s_texture</code>：纹理直方图的交集；</li>
+            <li><code>s_size</code>：<strong>鼓励合并小区域</strong>。定义为 1 − (size(r<sub>i</sub>) + size(r<sub>j</sub>)) / size(im)，
+            即两个区域越小，这一项越接近 1；作用是防止某个大区域不断吞并周围一切；</li>
+            <li><code>s_fill</code>：<strong>填充度</strong>。衡量合并后的区域与它的外接矩形有多贴合：
+            1 − (size(BB<sub>ij</sub>) − size(r<sub>i</sub>) − size(r<sub>j</sub>)) / size(im)。越能「填满」外接框，合并越被鼓励。</li>
+          </ul>
+        </li>
+        <li>
+          <strong>加权求和成单一相似度</strong>并贪心合并：
+          <div class="formula">
+            s(r<sub>i</sub>, r<sub>j</sub>) = a<sub>1</sub>·s<sub>color</sub> + a<sub>2</sub>·s<sub>texture</sub> + a<sub>3</sub>·s<sub>size</sub> + a<sub>4</sub>·s<sub>fill</sub>
+            <span class="lbl">式 2-1</span>
+          </div>
+          其中 <strong>a<sub>1..4</sub> ∈ {0, 1}</strong>。每轮把相似度最高的一对合并，并更新它与邻居的相似度（用高效的数据结构维护）。
+        </li>
+        <li>
+          <strong>记录合并轨迹</strong>：合并过程中产生的<strong>每一个</strong>区域都作为候选框输出。
+          然后按<strong>多样性策略</strong>取并集——例如在多种颜色空间（RGB、HSV、Lab 等）下、
+          用不同的 a 组合（论文跑了 80 种配置）分别执行，最后排序截断。
+          这样做的目的是让候选集合覆盖尽可能多的「可能物体」形态，而不是只偏向某一种相似度定义。
+        </li>
+        <li>
+          <strong>截断</strong>：把所有候选框按启发式分数排序，测试时取前 <strong>K ≈ 2000</strong> 个。
+          注意训练和测试可以取不同的 K（论文中训练和测试都常用 2000）。
+        </li>
+      </ol>
+
+      <div class="demo" id="demo-ss">
+        <div class="demo-title">交互演示 1 · 候选框数量 ↔ 召回率的权衡</div>
+        <p class="demo-hint">
+          这一步决定了整条链路的性能上限。拖动滑块：K 太小 → 物体完全没有候选框覆盖（阶段一漏检，后面救不回来）；
+          IoU 阈值越高 → 越难达到，因为候选框来自区域合并、天然不够精确。
+        </p>
+        <div class="demo-grid">
+          <div>
+            <canvas id="cv-ss" width="1200" height="720"></canvas>
+            <div class="legend">
+              <span><i style="background:#3ddc97"></i>IoU ≥ 0.7（高质量候选）</span>
+              <span><i style="background:#ffb454"></i>达到当前判定阈值</span>
+              <span><i style="background:#7b8cff"></i>低质量 / 背景候选</span>
+              <span><i style="background:none;border:1px dashed #3ddc97;width:13px;height:13px"></i>真值框</span>
+            </div>
+          </div>
+          <div class="ctrl">
+            <label>候选框数量 K <b><span id="ss-kv">2000</span></b></label>
+            <input type="range" id="ss-k" min="10" max="150" step="5" value="100">
+            <label>判定阈值 IoU <b><span id="ss-tv">0.50</span></b></label>
+            <input type="range" id="ss-t" min="30" max="90" step="5" value="50">
+            <div class="readout" id="ss-out"></div>
+          </div>
+        </div>
+      </div>
+
+      <h3>2.2 论文实测数字与工程注意点</h3>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>项目</th><th>数值</th><th>说明</th></tr></thead>
+          <tbody>
+            <tr><td>每图候选框数</td><td class="num">约 2000</td><td>测试时按分数截断；论文也报告过用更多候选的收益递减</td></tr>
+            <tr><td>召回率 @ IoU 0.5</td><td class="num">≈ 98%</td><td>这是二阶段检测能成立的<strong>前提条件</strong>：候选阶段几乎不漏</td></tr>
+            <tr><td>耗时</td><td class="num">1~2 s / 图</td><td>纯 CPU 单线程，与 CNN 的 GPU 计算无法重叠；换 GPU 也加速不了</td></tr>
+            <tr><td>图像缩放</td><td class="num">短边 → 500 或 600</td><td>论文用两套缩放以控制候选数量与显存；缩放同时影响 mAP 与速度</td></tr>
+            <tr><td>多样性配置</td><td class="num">80 组</td><td>多种颜色空间 × 多种相似度权重组合</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout warn">
+        <span class="t">三个容易踩的细节</span>
+        <p>① <strong>候选框不是物体框</strong>：大量候选是背景、物体的一部分或几个物体的拼接。后面 SVM 的负样本正是从这里挖出来的。</p>
+        <p>② <strong>训练时必须把真值框也塞进候选集合</strong>（并给最高分），否则某些物体可能没有足够好的候选框作为正样本。</p>
+        <p>③ <strong>K 是一个需要调的参数</strong>：K 太小伤召回，K 太大则 ③ 步耗时线性增长（因为每个候选都要跑一次 CNN）。
+        这个「召回 vs 计算量」的矛盾，正是 Faster R-CNN 用 RPN 替代它的动机之一。</p>
+      </div>
+    </section>
+
+    <!-- ================= 3 ================= -->
+    <section id="s3">
+      <h2><span class="num">03</span>第 2 步 · 区域归一化到 227×227</h2>
+      <p class="lead">
+        候选框尺寸千奇百怪，而 AlexNet 要求固定输入。这一步要把任意长宽比的区域变成 <strong>3×227×227</strong>。
+        看似简单的缩放，藏着两个会影响精度的细节：<strong>用什么缩放策略</strong>、<strong>要不要留上下文</strong>。
+      </p>
+
+      <h3>3.1 三种做法与论文的选择</h3>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>策略</th><th>做法</th><th>优点</th><th>缺点</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><strong>各向异性缩放（warp）</strong><br><span class="pill">论文最终采用</span></td>
+              <td>不管长宽比，直接把候选框内容拉伸成 227×227</td>
+              <td>实现最简单；所有像素都参与计算，无信息丢弃；缓存时最省空间</td>
+              <td>破坏物体的形状先验（高瘦的人被压扁）</td>
+            </tr>
+            <tr>
+              <td>各向同性缩放（crop）</td>
+              <td>保持长宽比，把候选框的短边缩放到 227，再用 227×227 的窗口在其中裁剪</td>
+              <td>保留形状先验，更符合物体真实外观</td>
+              <td>细长物体会被裁掉一部分（站立的人、公交车）；需要多次尝试不同裁剪位置</td>
+            </tr>
+            <tr>
+              <td>各向同性缩放（含上下文）</td>
+              <td>把候选框向外扩展（例如各方向扩 16 像素）后再保持长宽比缩放</td>
+              <td>额外补入了物体周围的环境信息，论文中该变体精度略高</td>
+              <td>上下文宽度需要作为超参调</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        论文的消融结论：三种做法在 VOC 上 mAP 接近（差距在 1~2 个点内），
+        但 <strong>warp 最简单、最快、最省缓存</strong>，因此被选为默认。
+        论文同时说明：为了补偿 warp 带来的形状失真，在缩放后的 patch 外围补了
+        <strong>p = 16 像素的均值像素（mean pixel）边框</strong>，人为给网络一点上下文。
+      </p>
+
+      <h3>3.2 精确的数值流程</h3>
+      <div class="formula">
+        设候选框在原图上为 (x, y, w, h)，目标尺寸 227×227，上下文 p = 16：<br><br>
+        ① <strong>扩展候选框</strong>：x' = x − p，y' = y − p，w' = w + 2p，h' = h + 2p<br>
+        ② <strong>从均值图上抠出该区域</strong>：超出原图边界的部分用<strong>均值像素</strong>填充（不是黑边，也不是零）<br>
+        ③ <strong>各向异性缩放到 227×227</strong>：横向缩放比 s<sub>x</sub> = 227 / w'，纵向 s<sub>y</sub> = 227 / h'<br>
+        ④ <strong>通道顺序与均值减法</strong>：AlexNet 训练时用的是 <var>BGR</var> 顺序与 ImageNet 均值，
+        这组预处理必须与预训练时完全一致
+        <span class="lbl">区域归一化</span>
+      </div>
+
+      <div class="demo" id="demo-warp">
+        <div class="demo-title">交互演示 2 · 亲手做一次 227×227 归一化</div>
+        <p class="demo-hint">
+          拖动左侧候选框，或用滑块改变它的长宽比；切换缩放策略与上下文宽度 p，实时看右侧 patch 的样子。
+          注意 warp 会改变形状，crop 会丢掉一部分内容，而 p 会给 patch 加上一圈灰色上下文。
+        </p>
+        <div class="demo-grid">
+          <div>
+            <canvas id="cv-warp" width="1200" height="620"></canvas>
+            <div class="legend">
+              <span><i style="background:#4cc9f0"></i>候选框（原始）</span>
+              <span><i style="background:#b57bff"></i>含上下文的扩展区域</span>
+              <span><i style="background:#3ddc97"></i>真值框</span>
+            </div>
+          </div>
+          <div class="ctrl">
+            <label>缩放策略</label>
+            <select id="warp-mode">
+              <option value="warp">各向异性 warp（论文默认）</option>
+              <option value="crop">各向同性 crop（保持长宽比）</option>
+            </select>
+            <label>上下文 p <b><span id="warp-pv">16</span> px</b></label>
+            <input type="range" id="warp-p" min="0" max="48" step="4" value="16">
+            <label>候选框长宽比 <b><span id="warp-arv">1.00</span></b></label>
+            <input type="range" id="warp-ar" min="30" max="300" step="5" value="100">
+            <div class="readout" id="warp-out"></div>
+            <p class="small muted" style="margin:0">
+              提示：把长宽比拖到极端（0.3 或 3.0），再对比 warp 与 crop 的结果——这就是「形状先验」的取舍。
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <div class="callout bad">
+        <span class="t">这里是复现时最容易出错的地方</span>
+        <p>预处理不一致导致的精度损失，通常比模型结构写错更严重。务必核对四件事：
+        <strong>通道顺序（原始 Caffe 模型是 BGR）</strong>、
+        <strong>均值减法的数值（ImageNet 均值，不是 0.5/0.5）</strong>、
+        <strong>缩放时是否做了抗锯齿插值</strong>、
+        <strong>p=16 的填充用的是均值像素还是零</strong>。
+        这四项任何一项错了，mAP 可能掉几个点到十几个点。</p>
+      </div>
+    </section>
+
+    <!-- ================= 4 ================= -->
+    <section id="s4">
+      <h2><span class="num">04</span>第 3 步 · CNN 前向提取 fc7 特征</h2>
+      <p class="lead">
+        把 227×227 的 patch 送进在 ImageNet 上预训练、又在检测数据上微调过的 AlexNet，
+        取<strong>倒数第二层全连接（fc7）的 4096 维输出</strong>作为该候选框的特征。
+        整个 R-CNN 的算力几乎都花在这一步。
+      </p>
+
+      <h3>4.1 AlexNet 逐层规格与参数量</h3>
+      <p class="small muted">
+        AlexNet 是 2012 年的设计，有几个今天看来不寻常的地方，但复现时不能改：
+        <strong>LRN（局部响应归一化）</strong>、<strong>conv1 的 11×11 大核 stride 4</strong>、
+        <strong>pool 是 3×3 stride 2 的重叠池化</strong>，以及三个巨大的全连接层。
+      </p>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>层</th><th>类型与配置</th><th>输出尺寸</th><th>参数量</th><th>备注</th></tr></thead>
+          <tbody>
+            <tr><td>input</td><td>—</td><td class="num">3×227×227</td><td class="num">0</td><td>BGR 顺序 + 均值减法</td></tr>
+            <tr><td>conv1</td><td>卷积 96×11×11, stride 4, ReLU</td><td class="num">96×55×55</td><td class="num">34,944</td><td>大核大步长，快速降分辨率</td></tr>
+            <tr><td>pool1</td><td>最大池化 3×3, stride 2</td><td class="num">96×27×27</td><td class="num">0</td><td>重叠池化</td></tr>
+            <tr><td>lrn1</td><td>局部响应归一化</td><td class="num">96×27×27</td><td class="num">0</td><td>无参数；现代网络已改用 BN 等</td></tr>
+            <tr><td>conv2</td><td>卷积 256×5×5, pad 2</td><td class="num">256×27×27</td><td class="num">614,656</td><td>—</td></tr>
+            <tr><td>pool2</td><td>最大池化 3×3, stride 2</td><td class="num">256×13×13</td><td class="num">0</td><td>—</td></tr>
+            <tr><td>conv3</td><td>卷积 384×3×3, pad 1</td><td class="num">384×13×13</td><td class="num">885,120</td><td>—</td></tr>
+            <tr><td>conv4</td><td>卷积 384×3×3, pad 1</td><td class="num">384×13×13</td><td class="num">1,327,488</td><td>—</td></tr>
+            <tr><td>conv5</td><td>卷积 256×3×3, pad 1</td><td class="num">256×13×13</td><td class="num">884,992</td><td>—</td></tr>
+            <tr><td><strong>pool5</strong></td><td>最大池化 3×3, stride 2</td><td class="num"><strong>256×6×6</strong></td><td class="num">0</td><td>展平为 <strong>9216 维</strong>，供边框回归使用</td></tr>
+            <tr><td>fc6</td><td>全连接 4096 + ReLU + dropout 0.5</td><td class="num">4096</td><td class="num">37,752,832</td><td><strong>单层占全网络 62% 参数</strong></td></tr>
+            <tr><td><strong>fc7</strong></td><td>全连接 4096 + ReLU</td><td class="num"><strong>4096</strong></td><td class="num">16,781,312</td><td>SVM 的输入特征</td></tr>
+            <tr><td>fc8</td><td>全连接 1000 + softmax</td><td class="num">1000</td><td class="num">4,097,000</td><td>微调时替换为 21 维（20 类 + 背景）</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="small muted">参数量合计约 61 M。其中三个全连接层占约 58 M，这是后来所有架构转向「全卷积 + 全局池化」的直接原因。</p>
+
+      <div class="demo" id="demo-layers">
+        <div class="demo-title">交互演示 3 · 逐层查看张量与参数量</div>
+        <p class="demo-hint">
+          点击任意一层，查看它的输入输出尺寸、参数量、计算量（FLOPs）与设计意图。
+          注意观察「特征图越来越小、通道越来越多、参数却几乎全在最后三个全连接层」这个反直觉事实。
+        </p>
+        <div class="stage-picker" id="layer-picker"></div>
+        <div class="stage-detail" id="layer-detail"></div>
+        <div id="layer-bars" style="margin-top:16px"></div>
+      </div>
+
+      <h3>4.2 为什么选 fc7 作为特征</h3>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>候选特征</th><th>维度</th><th>语义层级</th><th>论文结论</th></tr></thead>
+          <tbody>
+            <tr><td>pool5</td><td class="num">9216</td><td>浅（保留空间信息）</td><td>做分类不如 fc7，但<strong>因为保留了空间结构，反而更适合做边框回归的输入</strong></td></tr>
+            <tr><td>fc6</td><td class="num">4096</td><td>中</td><td>接近最佳</td></tr>
+            <tr><td><strong>fc7</strong></td><td class="num">4096</td><td>中深</td><td><strong>最佳</strong>：抽象程度与通用性平衡点，被选为 SVM 的输入</td></tr>
+            <tr><td>fc8</td><td class="num">1000</td><td>太深（绑定 ImageNet 类别）</td><td>明显下降：已过拟合到源任务的 1000 类判别空间，失去通用性</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="callout ok">
+        <span class="t">一条至今仍然成立的经验</span>
+        <p>用预训练网络的<strong>倒数第二层</strong>当通用特征，是跨任务的稳健选择：
+        太浅语义不足，太深则过拟合到源任务的类别空间。
+        这也是今天在 ViT / CLIP 上做检测、检索、度量学习时，特征通常取 neck 之前而非 logits 的原因。</p>
+      </div>
+
+      <h3>4.3 这一步的代价：为什么占 95% 的时间</h3>
+      <p>
+        2000 个候选框<strong>各自独立</strong>跑一次完整的 AlexNet 前向。而这些候选框彼此高度重叠
+        （IoU 常见 0.3~0.6），意味着<strong>同一块图像区域的卷积结果被反复计算了几十到上百次</strong>。
+      </p>
+      <div class="formula">
+        计算量估算（VGG16 版本，更直观）：<br>
+        单个 patch 前向 ≈ 15.5 GFLOPs　×　2000 个候选框 ≈ <strong>31 TFLOPs / 图</strong><br>
+        而如果只对整图做一次卷积（Fast R-CNN 的做法），同分辨率下约 <strong>0.2 TFLOPs</strong><br>
+        <span class="muted">→ 冗余倍数约 100+ 倍，这就是 Fast R-CNN 能提速 200 倍左右的根本原因</span>
+      </div>
+      <p class="small muted">
+        补充：R-CNN 的 SVM 与回归器共用这套特征，所以训练时特征只需抽取一次并缓存——
+        但这也带来了数百 GB 的磁盘写入与读取（见第 7 节）。
+      </p>
+    </section>
+
+    <!-- ================= 5 ================= -->
+    <section id="s5">
+      <h2><span class="num">05</span>第 4 步 · 逐类线性 SVM 打分</h2>
+      <p class="lead">
+        每个候选框得到一个 4096 维 fc7 之后，用 <strong>21 个独立的线性二分类 SVM</strong>
+        （VOC 20 个类别 + 1 个背景）分别打分，取分数最高的类别作为预测。
+        这一步是 R-CNN 最容易被问、也最容易答错的细节。
+      </p>
+
+      <h3>5.1 为什么不用微调时那个 softmax</h3>
+      <p>
+        作者把 CNN 微调好了，却不用它的 softmax 输出，而是把特征抽出来单独训 SVM。原因在<strong>正负样本的定义不同</strong>：
+      </p>
+      <div class="grid c2">
+        <div class="card">
+          <h4>微调时的定义（宽松）</h4>
+          <p>与某个真值框的 IoU <strong>≥ 0.5</strong> 就视为该类的正样本，IoU &lt; 0.5 视为背景。
+          一个只覆盖了半个人、或包含大量背景的框，也会被当作 person 的正样本去训练。</p>
+          <p class="small muted">→ softmax 学到的是「像 person 的区域」，对定位精度不敏感。</p>
+        </div>
+        <div class="card">
+          <h4>SVM 训练时的定义（严格）</h4>
+          <p><strong>只有真值框本身</strong>是正样本，其余全部是负样本，并且配合<strong>难例挖掘</strong>：
+          先用初始负样本训练，再专门把误检最严重的负样本加入迭代。</p>
+          <p class="small muted">→ 决策边界严格得多，特别擅长压制「背景被判成物体」。</p>
+        </div>
+      </div>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>配置（VOC 2007，无边框回归）</th><th>mAP</th><th>结论</th></tr></thead>
+          <tbody>
+            <tr><td>ImageNet 预训练 → fc7 + SVM（不微调）</td><td class="num">约 50.9%</td><td>迁移学习直接可用，但未适应检测域</td></tr>
+            <tr><td>域内微调后 → fc7 + softmax</td><td class="num">50.9%</td><td>把 fc8 换成 21 类联合训练</td></tr>
+            <tr><td><strong>域内微调后 → fc7 + 逐类 SVM</strong></td><td class="num"><strong>54.2%</strong></td><td>比 softmax 高约 <span class="pos">+3.3</span> 个点</td></tr>
+            <tr><td>域内微调后 → pool5 + SVM</td><td class="num">更高</td><td>论文报告 pool5 特征配 SVM 进一步提升</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>5.2 线性 SVM 的目标函数与求解</h3>
+      <p>对每个类别 c，单独训练一个线性 SVM，权重为 w<sub>c</sub>（4097 维，含偏置），优化目标为 L2 正则化的 hinge loss：</p>
+      <div class="formula">
+        min<sub>w<sub>c</sub></sub>　(1/2)‖w<sub>c</sub>‖² + C · Σ<sub>i</sub> max(0, 1 − y<sub>i</sub> · (w<sub>c</sub><sup>T</sup> f<sub>i</sub>))<br><br>
+        <span class="muted">其中 f<sub>i</sub> ∈ R<sup>4096</sup> 是第 i 个候选框的 fc7 特征，y<sub>i</sub> ∈ {+1, −1} 表示是否属于类别 c，
+        C 是正则强度，用验证集做 grid search 选取</span>
+        <span class="lbl">式 5-1</span>
+      </div>
+      <p>
+        实现上论文用的是 <strong>liblinear</strong> 这类通用线性分类器求解器。
+        注意这里是 <strong>20 个独立的二分类问题</strong>（one-vs-rest），而不是一个 21 类的多分类 softmax——
+        所以每个类别的分数之间<strong>没有归一化关系</strong>，不能当作概率，只能用于排序与阈值。
+      </p>
+
+      <h3>5.3 难例挖掘（Hard Negative Mining）的完整流程</h3>
+      <ol>
+        <li><strong>初始训练</strong>：对类别 c，用全部正样本（真值框）+ 一小批随机负样本训练初始 SVM；</li>
+        <li><strong>全量打分</strong>：用这个 SVM 对训练集上<strong>所有</strong>负样本候选框打分；</li>
+        <li><strong>挑出难例</strong>：把分数最高（即最容易被误判为正样本）的负样本挑出来，这些就是「难负样本」；</li>
+        <li><strong>追加重训</strong>：把难负样本加入训练集，重新训练 SVM；</li>
+        <li><strong>迭代</strong>：重复 2~4，论文做了 1~2 轮，并对 C 值做 grid search。</li>
+      </ol>
+      <div class="callout">
+        <span class="t">为什么必须做难例挖掘</span>
+        <p>候选框里绝大多数是背景，其中大部分「一眼就是背景」（天空、墙面）。随机采样得到的负样本太容易，
+        SVM 学不到真正的决策边界。难例挖掘把算力集中到<strong>最像物体的背景</strong>上。
+        这个思想后来演化成 OHEM（在线难例挖掘），再进一步被 <strong>Focal Loss</strong> 用损失加权的方式「软化」——
+        后者不需要显式挑选样本，但目标一致：<strong>降低易样本对损失的贡献</strong>。</p>
+      </div>
+
+      <h3>5.4 测试时的打分与选取</h3>
+      <p>
+        推理时，每个候选框会被<strong>所有 21 个 SVM 都打一遍分</strong>。然后：
+      </p>
+      <ul>
+        <li>取分数最高的类别作为该框的类别；</li>
+        <li>若最高分是「背景」类，或者最高分类别分数低于阈值，则该框被丢弃；</li>
+        <li>注意：<strong>每个框还会被所有类别的回归器都精修一遍</strong>（因为回归器也是逐类训练的），
+        再按该类分数排序。这是 R-CNN 的一个冗余点，Fast R-CNN 改成「先分类、只回归分数最高那一类」。</li>
+      </ul>
+      <div class="callout warn">
+        <span class="t">历史评价（很重要）</span>
+        <p>Fast R-CNN 论文明确指出：<strong>「用 SVM 而非 softmax 是不必要的」</strong>——
+        在联合微调的框架下，softmax 的表现已经超过 R-CNN 的 SVM 组合。
+        所以这段知识的价值不在「照做」，而在于两点：
+        ① 理解<strong>正负样本定义如何决定决策边界</strong>（今天做数据清洗、调采样策略时直接可用）；
+        ② 理解<strong>难例挖掘 → OHEM → Focal Loss</strong> 这条思想线索。</p>
+      </div>
+    </section>
+
+    <!-- ================= 6 ================= -->
+    <section id="s6">
+      <h2><span class="num">06</span>第 5 步 · 边框回归精修</h2>
+      <p class="lead">
+        候选框来自区域合并，只能「大概罩住」物体。这一步用一个线性回归器学习
+        <strong>从候选框到真值框的偏移量</strong>，在 VOC 2010 上再涨约 3.5 个 mAP。
+        这是「粗定位 → 细回归」在检测里的第一次落地，也是今天所有 anchor-based 检测器的标配。
+      </p>
+
+      <h3>6.1 参数化：为什么中心点要归一化、宽高要取 log</h3>
+      <p>记候选框 P = (P<sub>x</sub>, P<sub>y</sub>, P<sub>w</sub>, P<sub>h</sub>)，真值框 G = (G<sub>x</sub>, G<sub>y</sub>, G<sub>w</sub>, G<sub>h</sub>)，回归目标 t 定义为：</p>
+      <div class="formula">
+        t<sub>x</sub> = (G<sub>x</sub> − P<sub>x</sub>) / P<sub>w</sub>　　　　t<sub>y</sub> = (G<sub>y</sub> − P<sub>y</sub>) / P<sub>h</sub><br>
+        t<sub>w</sub> = log(G<sub>w</sub> / P<sub>w</sub>)　　　　　t<sub>h</sub> = log(G<sub>h</sub> / P<sub>h</sub>)
+        <span class="lbl">式 6-1（编码）</span>
+      </div>
+      <ul>
+        <li><strong>中心点除以宽高</strong>：把绝对像素偏移变成<strong>相对偏移</strong>。
+        这样同样「向右偏 10%」在大框和小框上产生一致的回归目标，一个线性模型就能覆盖所有尺度；</li>
+        <li><strong>宽高取 log</strong>：宽高的变化本质是<strong>乘性</strong>的（放大 1.5 倍），取 log 后变成加性，
+        更适合线性回归；同时 log 天然约束了正负范围，数值更稳定；</li>
+        <li>若不做这两种归一化，回归器需要针对每个尺度单独调参，且对离群值极度敏感。</li>
+      </ul>
+      <p>预测时反解回来（这就是推理阶段真正执行的公式）：</p>
+      <div class="formula">
+        Ĝ<sub>x</sub> = P<sub>w</sub> · d<sub>x</sub>(P) + P<sub>x</sub>　　　　Ĝ<sub>y</sub> = P<sub>h</sub> · d<sub>y</sub>(P) + P<sub>y</sub><br>
+        Ĝ<sub>w</sub> = P<sub>w</sub> · exp(d<sub>w</sub>(P))　　Ĝ<sub>h</sub> = P<sub>h</sub> · exp(d<sub>h</sub>(P))
+        <span class="lbl">式 6-2（解码）</span>
+      </div>
+      <p>其中 d<sub>★</sub>(P) = <strong>w</strong><sub>★</sub><sup>T</sup> · φ<sub>5</sub>(P)，φ<sub>5</sub>(P) 是 <strong>pool5 的 9216 维特征</strong>，<strong>w</strong><sub>★</sub> 是待学的权重。</p>
+
+      <div class="demo" id="demo-bbox">
+        <div class="demo-title">交互演示 4 · 边框回归的编码与解码计算器</div>
+        <p class="demo-hint">
+          拖动候选框与真值框，实时看到四个偏移量 t 的计算结果；再拖动「预测的偏移量」，
+          看解码公式如何把候选框修正成最终框。这是全页最值得亲手算一遍的公式。
+        </p>
+        <div class="demo-grid">
+          <div>
+            <canvas id="cv-bbox" width="1300" height="560"></canvas>
+            <div class="legend">
+              <span><i style="background:#4cc9f0"></i>候选框 P</span>
+              <span><i style="background:#3ddc97"></i>真值框 G</span>
+              <span><i style="background:#b57bff"></i>回归后的预测框 Ĝ</span>
+            </div>
+          </div>
+          <div class="ctrl">
+            <label>d<sub>x</sub>（横向偏移） <b><span id="bb-dxv">0.00</span></b></label>
+            <input type="range" id="bb-dx" min="-100" max="100" step="5" value="0">
+            <label>d<sub>y</sub>（纵向偏移） <b><span id="bb-dyv">0.00</span></b></label>
+            <input type="range" id="bb-dy" min="-100" max="100" step="5" value="0">
+            <label>d<sub>w</sub>（宽度 log 比） <b><span id="bb-dwv">0.00</span></b></label>
+            <input type="range" id="bb-dw" min="-60" max="60" step="5" value="0">
+            <label>d<sub>h</sub>（高度 log 比） <b><span id="bb-dhv">0.00</span></b></label>
+            <input type="range" id="bb-dh" min="-60" max="60" step="5" value="0">
+            <div class="btn-row">
+              <button class="btn primary" id="bb-fit">把 d 设为「完美回归」（d = t）</button>
+              <button class="btn" id="bb-reset">归零</button>
+            </div>
+            <div class="readout" id="bb-out"></div>
+            <p class="small muted" style="margin:0">
+              目标：让预测框 Ĝ 尽量贴近真值框 G。点击「完美回归」可以看到 d = t 时两者完全重合——
+              这也是训练时回归器要学的东西。
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <h3>6.2 损失函数与训练细节</h3>
+      <div class="formula">
+        w<sub>★</sub> = argmin<sub>ŵ<sub>★</sub></sub> Σ<sub>i ∈ {x, y, w, h}</sub> (t<sub>★</sub><sup>i</sup> − ŵ<sub>★</sub><sup>T</sup> φ<sub>5</sub>(P<sup>i</sup>))² + λ‖ŵ<sub>★</sub>‖²
+        <span class="lbl">式 6-3（岭回归）</span>
+      </div>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>细节</th><th>取值</th><th>原因</th></tr></thead>
+          <tbody>
+            <tr><td>回归器数量</td><td>每类一个（VOC 20 个，各输出 4 个值）</td><td>不同类别的形变模式不同（人细长、车扁平）</td></tr>
+            <tr><td>输入特征</td><td>pool5，9216 维</td><td>比 fc7 保留了更多空间信息，回归位置更合适</td></tr>
+            <tr><td>参与训练的样本</td><td>仅 IoU ≥ 0.6 的候选框</td><td>离真值太远的框，偏移量没有回归意义，还会污染拟合</td></tr>
+            <tr><td>正则化</td><td>L2，λ = 1000（论文用验证集 grid search）</td><td>每类可用样本少，强正则防止过拟合</td></tr>
+            <tr><td>训练目标</td><td>式 6-1 的四元组</td><td>—</td></tr>
+            <tr><td>测试时的应用</td><td>对每个候选框、每个类别都输出一组 d</td><td>R-CNN 的冗余点，Fast R-CNN 改为只回归最高分那一类</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>配置</th><th>VOC 2010 mAP</th><th>增益</th></tr></thead>
+          <tbody>
+            <tr><td>R-CNN 无边框回归</td><td class="num">50.2%</td><td>—</td></tr>
+            <tr><td>R-CNN + 边框回归</td><td class="num">53.7%</td><td class="pos">+3.5</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout ok">
+        <span class="t">这套参数化如何延续到今天</span>
+        <p>Faster R-CNN（RPN 的 anchor 回归）、SSD、YOLOv2 及之后、RetinaNet 全部沿用
+        「中心点除以宽高 + 宽高取 log」的编码方式。变化的是<strong>损失函数</strong>：
+        R-CNN 用 L2 → Fast R-CNN 换成 <strong>Smooth L1</strong>（对离群点更鲁棒）→
+        再后来换成 <strong>IoU / GIoU / DIoU / CIoU Loss</strong>（直接优化框的重叠度，而不是逐坐标的数值差）。</p>
+      </div>
+    </section>
+
+    <!-- ================= 7 ================= -->
+    <section id="s7">
+      <h2><span class="num">07</span>训练流程：四个阶段与全部超参数</h2>
+      <p class="lead">
+        R-CNN 的训练是<strong>四次独立的过程、三次落盘</strong>。这一节把每个阶段的学习率、batch 组成、
+        样本定义、迭代次数全部摊开——这是动手复现时唯一能救命的东西。
+      </p>
+
+      <h3>7.1 阶段一：ImageNet 有监督预训练</h3>
+      <ul>
+        <li><strong>数据</strong>：ILSVRC 2012 分类集，1000 类，约 120 万张图；</li>
+        <li><strong>输入</strong>：随机采样 224×224 patch（测试时中心裁剪 + 10-crop 平均）；</li>
+        <li><strong>优化</strong>：SGD，初始学习率 <code>0.01</code>，每 100k 迭代除以 10，共 <strong>310k</strong> 迭代；</li>
+        <li><strong>其他</strong>：momentum 0.9，weight decay 5e-4，dropout 0.5（fc6 / fc7）。</li>
+      </ul>
+
+      <h3>7.2 阶段二：域内微调（Domain-specific Fine-tuning）</h3>
+      <p>把 1000 类分类网络改造成 21 类（20 类物体 + 背景）的检测网络：</p>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>项目</th><th>设置</th><th>说明</th></tr></thead>
+          <tbody>
+            <tr><td>分类头改造</td><td>fc8 从 1000 维换成 <strong>21 维</strong>，随机初始化</td><td>其余层用预训练权重初始化</td></tr>
+            <tr><td>输入</td><td>候选框 warp 到 227×227</td><td><strong>用全部候选框</strong>，不做筛选</td></tr>
+            <tr><td>正样本</td><td>与某真值框 IoU <strong>≥ 0.5</strong> → 该类</td><td>宽松定义，这是与 SVM 阶段的关键差异</td></tr>
+            <tr><td>负样本</td><td>与所有真值框 IoU <strong>&lt; 0.5</strong> → 背景（第 21 类）</td><td>—</td></tr>
+            <tr><td>每个 batch 组成</td><td><strong>32 个正样本（每类）+ 96 个背景</strong></td><td>正负比约 1:3；正样本跨类别均匀采样</td></tr>
+            <tr><td>学习率</td><td><code>0.001</code>（预训练的 1/10）</td><td>数据量远小于 ImageNet，大学习率会灾难性遗忘</td></tr>
+            <tr><td>迭代次数</td><td><strong>30k</strong></td><td>远少于预训练的 310k</td></tr>
+            <tr><td>收益</td><td>约 <span class="pos">+5 个 mAP</span></td><td>论文中最有价值的工程结论之一：域内微调几乎总是值得的</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="callout warn">
+        <span class="t">为什么学习率必须降 10 倍</span>
+        <p>VOC 检测数据约 1 万张图，ImageNet 有 120 万张，差了<strong>两个数量级</strong>。
+        沿用大学习率会让网络在几十次迭代内迅速遗忘预训练学到的通用特征
+        （灾难性遗忘）。<strong>「小学习率 + 少迭代」是迁移学习微调的标准配方</strong>，
+        直接适用于今天 fine-tune 大模型与视觉骨干。</p>
+      </div>
+
+      <h3>7.3 阶段三：抽取特征并训练逐类 SVM</h3>
+      <ol>
+        <li>对训练集每张图的每个候选框，warp 后跑一次前向，取 <strong>fc7（4096 维）</strong> 写入磁盘；</li>
+        <li><strong>正样本</strong>：<strong>只有真值框本身</strong>（实现上把真值框也作为候选加入）；</li>
+        <li><strong>负样本</strong>：与所有真值框 IoU 较低的候选框（论文用 IoU &lt; 0.5 归为背景类）；</li>
+        <li>对每个类别训练一个线性 SVM（式 5-1），并用<strong>难例挖掘</strong>迭代 1~2 轮；</li>
+        <li>用验证集对 C 做 grid search。</li>
+      </ol>
+
+      <h3>7.4 阶段四：训练边框回归器</h3>
+      <ul>
+        <li>输入特征：<strong>pool5，9216 维</strong>（与 SVM 用的 fc7 不同！）；</li>
+        <li>样本：与对应真值框 IoU ≥ <strong>0.6</strong> 的候选框；</li>
+        <li>目标：式 6-1 的四元组；</li>
+        <li>求解：岭回归（式 6-3），λ 由验证集 grid search 得到。</li>
+      </ul>
+
+      <div class="demo" id="demo-dg">
+        <div class="demo-title">交互演示 5 · 这套流程的存储与 I/O 代价</div>
+        <p class="demo-hint">
+          拖动滑块估算中间结果的数据量。R-CNN 的训练速度有一半受限于 I/O 与磁盘，
+          因为 CNN 和 SVM 是两个进程，中间特征必须落盘再读回。
+        </p>
+        <div class="demo-grid">
+          <div class="ctrl">
+            <label>训练图像数 <b><span id="dg-nv">10,000</span></b></label>
+            <input type="range" id="dg-n" min="1000" max="120000" step="1000" value="10000">
+            <label>类别数（VOC = 20） <b><span id="dg-cv">20</span></b></label>
+            <input type="range" id="dg-c" min="1" max="80" step="1" value="20">
+            <label>难例挖掘轮数 <b><span id="dg-mv">2</span></b></label>
+            <input type="range" id="dg-m" min="1" max="5" step="1" value="2">
+            <div class="readout" id="dg-out"></div>
+          </div>
+          <div>
+            <p class="small">
+              <strong>四次独立过程</strong>：① ImageNet 预训练　② 域内微调　③ 抽 fc7 训 SVM　④ 抽 pool5 训回归器。
+              每一步的产物都要写盘：微调后的模型权重、全部候选框的 fc7 特征、全部候选框的 pool5 特征。
+            </p>
+            <p class="small muted">
+              论文提到的特征文件达到<strong>数百 GB</strong> 量级，训练一轮需要数小时到十几小时。
+              这也是 Fast R-CNN 论文反复强调的痛点：<em>multi-stage pipeline … features are written to disk</em>。
+              端到端联合训练不只是优雅问题，更是训练效率问题。
+            </p>
+            <p class="small muted">
+              <strong>另一个隐藏成本</strong>：一旦发现预处理写错了，整个特征缓存必须重抽一遍——
+              这是几百 GB 的重新计算。所以第 3 节的预处理细节务必先验证再开抽。
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <h3>7.5 超参数总表（可直接对照复现）</h3>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>阶段</th><th>超参</th><th>取值</th></tr></thead>
+          <tbody>
+            <tr><td rowspan="5">① ImageNet 预训练</td><td>输入</td><td>224×224（随机裁剪）</td></tr>
+            <tr><td>学习率 / 衰减</td><td>0.01，每 100k 迭代 ÷10</td></tr>
+            <tr><td>总迭代</td><td>310k</td></tr>
+            <tr><td>momentum / weight decay</td><td>0.9 / 5e-4</td></tr>
+            <tr><td>dropout</td><td>0.5（fc6, fc7）</td></tr>
+            <tr><td rowspan="5">② 域内微调</td><td>输入</td><td>227×227（warp，p=16）</td></tr>
+            <tr><td>学习率 / 迭代</td><td>0.001 / 30k</td></tr>
+            <tr><td>正样本定义</td><td>IoU ≥ 0.5</td></tr>
+            <tr><td>batch 组成</td><td>32 正 + 96 负</td></tr>
+            <tr><td>输出类别</td><td>21（20 类 + 背景）</td></tr>
+            <tr><td rowspan="3">③ 逐类 SVM</td><td>特征</td><td>fc7（4096 维）</td></tr>
+            <tr><td>正样本</td><td>仅真值框</td></tr>
+            <tr><td>负样本策略</td><td>难例挖掘 1~2 轮，C 用验证集调</td></tr>
+            <tr><td rowspan="3">④ 边框回归</td><td>特征</td><td>pool5（9216 维）</td></tr>
+            <tr><td>样本筛选</td><td>IoU ≥ 0.6</td></tr>
+            <tr><td>正则</td><td>岭回归，λ = 1000</td></tr>
+            <tr><td rowspan="3">推理</td><td>候选框数 K</td><td>2000</td></tr>
+            <tr><td>NMS 阈值</td><td>0.3（类内贪心）</td></tr>
+            <tr><td>图像缩放</td><td>短边 → 500 或 600</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ================= 8 ================= -->
+    <section id="s8">
+      <h2><span class="num">08</span>推理流程：单步拆解与计时</h2>
+      <p class="lead">
+        推理是纯前向的六个步骤，串行执行、无法端到端优化。
+        下面这个演示把每一步的<strong>输入张量、输出张量、参数量与耗时占比</strong>挂在一起，点一下就知道钱花在哪了。
+      </p>
+
+      <div class="demo" id="demo-pipe">
+        <div class="demo-title">交互演示 6 · 推理流水线逐步查看</div>
+        <p class="demo-hint">点击任意阶段，查看它的输入/输出规格、是否可学习、以及耗时占比（数值来自论文与常见复现，为量级参考）。</p>
+        <div id="pipe-svg-wrap">
+          <svg viewBox="0 0 1120 250" role="img" aria-label="R-CNN 推理流水线示意图">
+            <defs>
+              <marker id="arw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M 0 0 L 10 5 L 0 10 z" fill="#4cc9f0"></path>
+              </marker>
+              <linearGradient id="g-img" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0" stop-color="#1b2a52"></stop><stop offset="1" stop-color="#111a35"></stop>
+              </linearGradient>
+            </defs>
+            <g id="pipe-stages" style="cursor:pointer"></g>
+          </svg>
+        </div>
+        <div class="stage-picker" id="pipe-picker"></div>
+        <div class="stage-detail" id="pipe-detail"></div>
+      </div>
+
+      <h3>8.1 一段可复现的伪代码</h3>
+      <pre><code><span class="cm"># 输入：一张 RGB 图像 image</span>
+
+<span class="cm"># ① 候选区域生成（纯 CPU，与类别无关）</span>
+boxes = selective_search(image, k=<span class="st">2000</span>)          <span class="cm"># -> [(x1, y1, x2, y2), ...]</span>
+boxes.append(ground_truth_boxes)                   <span class="cm"># 训练时；测试时不需要</span>
+
+<span class="cm"># ②③ 逐框归一化 + CNN 前向（R-CNN 的性能瓶颈就在这里）</span>
+features_fc7, features_pool5 = [], []
+<span class="kw">for</span> b <span class="kw">in</span> boxes:
+    patch = crop_with_context(image, b, p=<span class="st">16</span>)     <span class="cm"># 外围补均值像素</span>
+    patch = resize_anisotropic(patch, <span class="st">227</span>, <span class="st">227</span>)     <span class="cm"># 各向异性缩放</span>
+    patch = bgr_normalize(patch, IMAGENET_MEAN)     <span class="cm"># 预处理必须与训练一致</span>
+    f_pool5, f_fc7 = alexnet_forward(patch)         <span class="cm"># 一次完整前向，无共享</span>
+    features_fc7.append(f_fc7)                     <span class="cm"># 4096 维</span>
+    features_pool5.append(f_pool5)                 <span class="cm"># 9216 维</span>
+
+<span class="cm"># ④ 逐类 SVM 打分</span>
+scores = [svm_c(f) <span class="kw">for</span> svm_c <span class="kw">in</span> svms <span class="kw">for</span> f <span class="kw">in</span> features_fc7]   <span class="cm"># 每框 21 个分数</span>
+
+<span class="cm"># ⑤ 边框回归精修（逐类）</span>
+<span class="kw">for</span> i, b <span class="kw">in</span> <span class="fn">enumerate</span>(boxes):
+    <span class="kw">for</span> c <span class="kw">in</span> classes:
+        d = regressor[c](features_pool5[i])         <span class="cm"># 4 个偏移量</span>
+        boxes[i][c] = decode(b, d)                  <span class="cm"># 式 6-2</span>
+
+<span class="cm"># ⑥ 每个类别做贪心 NMS</span>
+results = []
+<span class="kw">for</span> c <span class="kw">in</span> classes:
+    results += nms(boxes_of_class(boxes, c), scores[c], iou_thr=<span class="st">0.3</span>)</code></pre>
+
+      <h3>8.2 实测耗时拆解（VGG16 版本，Titan Black）</h3>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>步骤</th><th>操作</th><th>耗时</th><th>占比</th></tr></thead>
+          <tbody>
+            <tr><td>①</td><td>Selective Search 生成约 2000 个候选框</td><td class="num">1~2 s</td><td class="num">约 3%</td></tr>
+            <tr><td>②③</td><td>逐框 warp + AlexNet 前向</td><td class="num">约 45 s</td><td class="num"><span class="neg">约 95%</span></td></tr>
+            <tr><td>④</td><td>21 个 SVM 打分（2000×21 次点积）</td><td class="num">约 0.5 s</td><td class="num">约 1%</td></tr>
+            <tr><td>⑤</td><td>边框回归（2000×20 组偏移量）</td><td class="num">约 0.5 s</td><td class="num">约 1%</td></tr>
+            <tr><td>⑥</td><td>类内 NMS</td><td class="num">可忽略</td><td class="num">≈0%</td></tr>
+            <tr><td colspan="2"><strong>合计</strong></td><td class="num"><strong>约 47 s / 图</strong></td><td class="num">—</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="small muted">
+        AlexNet 版本约 <strong>13 s / 图</strong>（候选框 2000、单次前向更快）。
+        结论非常清晰：<strong>95% 的时间花在「对 2000 个高度重叠的框重复做卷积」</strong>，
+        而 Selective Search 只占 3%，SVM 与回归加起来不到 2%。
+        所以优化方向不是换分类器，而是消除卷积冗余——这正是 Fast R-CNN 的切入点。
+      </p>
+    </section>
+
+    <!-- ================= 9 ================= -->
+    <section id="s9">
+      <h2><span class="num">09</span>第 6 步 · NMS 与最终输出格式</h2>
+      <p class="lead">
+        同一物体周围会有多个候选框都被判为同一类别（分数不同）。NMS 的任务是<strong>每个物体只留一个最好的框</strong>。
+        R-CNN 用的是<strong>类内贪心 NMS，IoU 阈值 0.3</strong>——比你在 YOLO 里习惯的 0.45~0.5 更激进，
+        因为选择性搜索产生的候选框之间冗余更大。
+      </p>
+
+      <div class="demo" id="demo-iou">
+        <div class="demo-title">交互演示 7 · 亲手拖 IoU，再调 NMS 阈值</div>
+        <p class="demo-hint">
+          左侧拖动两个框实时算 IoU；右侧拖动阈值，看 14 个检测框里哪些被抑制。
+          IoU 的定义很简单，但它在 R-CNN 里出现了五次（见下表），每次的阈值都不同。
+        </p>
+        <div class="demo-grid">
+          <div>
+            <canvas id="cv-iou" width="1300" height="620"></canvas>
+          </div>
+          <div class="ctrl">
+            <label>NMS 阈值 <b><span id="nms-thv">0.30</span></b></label>
+            <input type="range" id="nms-th" min="5" max="95" step="5" value="30">
+            <div class="readout">
+              <div><span>IoU 定义</span><span>交集 / 并集</span></div>
+              <div><span>微调正样本</span><span>IoU ≥ 0.5</span></div>
+              <div><span>微调负样本</span><span>IoU &lt; 0.5</span></div>
+              <div><span>回归样本筛选</span><span>IoU ≥ 0.6</span></div>
+              <div><span>NMS 抑制</span><span>同类内 IoU &gt; 0.3</span></div>
+              <div><span>VOC mAP 判定</span><span>IoU ≥ 0.5 算正确</span></div>
+            </div>
+            <p class="small muted" style="margin:0">
+              阈值太大 → 同一物体留下多个框（误检多，精度下降）；阈值太小 → 相邻物体被误删（漏检多，召回下降）。
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <h3>9.1 贪心 NMS 的精确伪代码</h3>
+      <pre><code><span class="cm"># 输入：同一类别的所有候选框 boxes (N,4) xyxy，对应分数 scores (N)，阈值 thr=0.3</span>
+<span class="kw">def</span> <span class="fn">nms</span>(boxes, scores, thr):
+    order = scores.argsort()[::-1]        <span class="cm"># 1. 按分数从高到低排序</span>
+    keep = []
+    <span class="kw">while</span> order.size &gt; 0:
+        i = order[0]
+        keep.append(i)                    <span class="cm"># 2. 当前分数最高的框一定保留</span>
+        <span class="kw">if</span> order.size == 1: <span class="kw">break</span>
+        ious = iou_of(boxes[i], boxes[order[1:]])   <span class="cm"># 3. 与剩余所有框算 IoU</span>
+        order = order[1:][ious &lt;= thr]              <span class="cm"># 4. 只保留 IoU 不超过阈值的</span>
+    <span class="kw">return</span> keep
+
+<span class="cm"># 注意：R-CNN 是"类内"调用，即对每个类别分别执行一次 NMS</span>
+<span class="cm">#      如果做成"跨类" NMS（所有类别一起做），"人骑着车"这类重叠物体会被误删</span></code></pre>
+
+      <h3>9.2 最终输出格式</h3>
+      <p>NMS 之后，每张图输出一个变长列表，每个元素为：</p>
+      <div class="formula">
+        (class_id, score, x<sub>min</sub>, y<sub>min</sub>, x<sub>max</sub>, y<sub>max</sub>)<br>
+        <span class="muted">
+          · class_id：0~19 表示 VOC 的 20 类（第 21 个 SVM 输出的「背景」不产生结果）<br>
+          · score：该类别 SVM 的原始分数（<strong>不是概率</strong>，因为每类是独立的二分类 SVM，未做归一化）<br>
+          · 坐标：原图像素坐标（注意回归是在原图坐标系下做的，不是特征图坐标）<br>
+          · 同一张图可能有多个同类框（不同物体），也可能一个都没有
+        </span>
+        <span class="lbl">输出格式</span>
+      </div>
+      <div class="callout warn">
+        <span class="t">两个容易搞错的点</span>
+        <p>① <strong>分数不是概率</strong>：21 个 SVM 各自独立输出，分数之间没有归一化关系，加起来不等于 1。
+        所以不能直接当置信度用于业务阈值，通常需要重新做一次归一化（如 Platt scaling）或改用 softmax 版本。</p>
+        <p>② <strong>NMS 前是否要按分数截断</strong>：工程实现通常会先把分数低于阈值的框丢掉再做 NMS，
+        既减少计算量，也避免低分框干扰。这个顺序会影响最终结果，必须与评估脚本保持一致。</p>
+      </div>
+
+      <h3>9.3 R-CNN 里的 IoU 出现了五次，别混用</h3>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>用途</th><th>阈值</th><th>作用</th></tr></thead>
+          <tbody>
+            <tr><td>微调的正样本</td><td class="num">IoU ≥ 0.5</td><td>判定候选框属于哪一类（宽松，为了让网络看到更多样本）</td></tr>
+            <tr><td>微调的负样本</td><td class="num">IoU &lt; 0.5</td><td>判定为背景类</td></tr>
+            <tr><td>SVM 的正样本</td><td class="num">仅真值框</td><td>判定边界更严格，这是 SVM 略优于 softmax 的原因</td></tr>
+            <tr><td>边框回归的样本筛选</td><td class="num">IoU ≥ 0.6</td><td>太远的框偏移量无意义，不参与拟合</td></tr>
+            <tr><td>NMS</td><td class="num">IoU &gt; 0.3 抑制</td><td>类内去重</td></tr>
+            <tr><td>评估（VOC mAP）</td><td class="num">IoU ≥ 0.5</td><td>判定检测框是否正确</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="small muted">
+        工业界常用 <strong>Soft-NMS</strong> 替代贪心 NMS：不直接删除重叠框，而是按 IoU 衰减它的分数
+        （s ← s·(1−IoU) 或 s·exp(−IoU²/σ)）。在行人检测、细胞检测、货架商品这类密集场景，
+        换成 Soft-NMS 往往比改网络结构更快见效。
+      </p>
+    </section>
+
+    <!-- ================= 10 ================= -->
+    <section id="s10">
+      <h2><span class="num">10</span>速查表与 FAQ</h2>
+
+      <h3>10.1 六步流程速查（打印版）</h3>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>#</th><th>步骤</th><th>关键操作</th><th>关键参数</th><th>常见错误</th></tr></thead>
+          <tbody>
+            <tr><td>1</td><td>候选区域</td><td>Selective Search 层次化合并超像素</td><td>K=2000，短边缩放到 500/600</td><td>训练时忘记把真值框加入候选集合</td></tr>
+            <tr><td>2</td><td>区域归一化</td><td>扩展 p=16 → 补均值像素 → warp 到 227×227</td><td>p=16，各向异性</td><td>通道顺序（BGR）与均值不一致</td></tr>
+            <tr><td>3</td><td>CNN 前向</td><td>AlexNet 逐框前向，取 fc7 / pool5</td><td>fc7=4096，pool5=9216</td><td>误以为可以整图卷积一次（那是 Fast R-CNN）</td></tr>
+            <tr><td>4</td><td>SVM 打分</td><td>21 个独立线性 SVM 各自打分</td><td>难例挖掘 1~2 轮</td><td>把 IoU≥0.5 的框当作 SVM 正样本</td></tr>
+            <tr><td>5</td><td>边框回归</td><td>pool5 → 4 个偏移量 → 式 6-2 解码</td><td>IoU≥0.6，λ=1000</td><td>用 fc7 而不是 pool5 做回归输入；用全部候选训练</td></tr>
+            <tr><td>6</td><td>NMS</td><td>类内贪心抑制</td><td>IoU 阈值 0.3</td><td>做成跨类 NMS，误删重叠的不同类物体</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>10.2 复现时最容易踩的 12 个坑</h3>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>#</th><th>坑</th><th>正确做法</th></tr></thead>
+          <tbody>
+            <tr><td>1</td><td>忘记把真值框加入候选集合</td><td>训练时务必 append 真值框（给最高分），否则正样本可能极度稀缺</td></tr>
+            <tr><td>2</td><td>微调沿用预训练学习率</td><td>降为 1/10（0.001），迭代数也从 310k 降到 30k</td></tr>
+            <tr><td>3</td><td>正负样本比例失衡</td><td>每 batch 32 正 + 96 负（约 1:3）</td></tr>
+            <tr><td>4</td><td>SVM 用全部负样本训练</td><td>必须做难例挖掘，否则决策边界被「简单背景」主导</td></tr>
+            <tr><td>5</td><td>把 IoU≥0.5 的框当 SVM 正样本</td><td>只有真值框本身是正样本——这是与微调阶段的关键差异</td></tr>
+            <tr><td>6</td><td>回归器用所有候选框训练</td><td>只用 IoU ≥ 0.6 的候选框</td></tr>
+            <tr><td>7</td><td>回归器输入用了 fc7</td><td>论文用的是 <strong>pool5（9216 维）</strong>，保留空间信息更利于定位</td></tr>
+            <tr><td>8</td><td>warp 时忘了 padding，或用零填充</td><td>补 p=16 像素的<strong>均值像素</strong>，保留上下文</td></tr>
+            <tr><td>9</td><td>测试时图像未统一缩放</td><td>短边缩放到 600（VGG 版）以控制候选数量与显存</td></tr>
+            <tr><td>10</td><td>NMS 阈值用错或做成跨类</td><td>R-CNN 用 0.3 且类内；跨类 NMS 会删掉重叠的不同类物体</td></tr>
+            <tr><td>11</td><td>SVM 分数当概率使用</td><td>21 个独立二分类，分数未归一化，需重新校准</td></tr>
+            <tr><td>12</td><td>预处理与训练不一致</td><td>逐项核对：通道顺序、均值、插值方式、填充值</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>10.3 FAQ（按被问频率排序）</h3>
+      <ol>
+        <li><strong>R-CNN 的完整流程？</strong>
+        Selective Search 生成约 2000 个候选框 → 各自扩展 p=16 并 warp 到 227×227 → AlexNet 前向取 fc7 →
+        21 个线性 SVM 打分 → 20 个回归器逐类精修 → 类内贪心 NMS（IoU 0.3）。</li>
+
+        <li><strong>为什么用 SVM 不用 softmax？</strong>
+        两者正负样本定义不同：微调用 IoU≥0.5 的宽松定义，SVM 只用真值框且配合难例挖掘，判定边界更严格。
+        论文实测高约 3.3 个点。但 Fast R-CNN 已证明在联合微调下 softmax 足够好，所以这条是历史细节，
+        真正要记住的是<strong>样本定义如何影响决策边界</strong>。</li>
+
+        <li><strong>候选框为什么是 2000 个？</strong>
+        Selective Search 按启发式分数排序后截断。这是一个工程折中：
+        2000 个能保证约 98% 的召回率（IoU≥0.5），同时把第 3 步的计算量控制在可接受范围。K 是可以调的参数。</li>
+
+        <li><strong>为什么取 fc7 而不是 pool5 或 fc8？</strong>
+        fc7 兼顾语义抽象与通用性。pool5 语义浅但保留空间结构，因此更适合做<strong>边框回归</strong>的输入；
+        fc8 已过拟合到 ImageNet 的 1000 类判别空间，迁移性明显下降。</li>
+
+        <li><strong>边框回归的输入特征和目标分别是什么？</strong>
+        输入 pool5（9216 维），目标为式 6-1 的四元组。逐类训练岭回归（λ=1000），
+        只用与真值框 IoU ≥ 0.6 的候选框。</li>
+
+        <li><strong>为什么宽高要取 log？</strong>
+        把乘性缩放变成加性偏移，使一个线性模型能覆盖所有尺度；同时约束取值范围、提升数值稳定性。
+        中心点则除以候选框的宽高做归一化，同理。</li>
+
+        <li><strong>微调时学习率为什么降 10 倍？</strong>
+        检测数据量（约 1 万张）比 ImageNet（120 万张）少两个数量级，大学习率会迅速破坏预训练特征
+        （灾难性遗忘）。这是迁移学习微调的标准配方。</li>
+
+        <li><strong>R-CNN 为什么这么慢？</strong>
+        2000 个高度重叠的候选框各自独立跑一次完整 CNN 前向，卷积特征被重复计算上百倍，
+        占约 95% 的时间。Selective Search 只占 3%。</li>
+
+        <li><strong>如果只允许你改一处，改哪里？</strong>
+        改第 3 步：让所有候选框共享一次整图卷积，再用 RoI Pooling 从共享特征图上取各自的特征。
+        这就是 Fast R-CNN，能把测试时间从几十秒降到约 2 秒。</li>
+
+        <li><strong>这套流程在今天的检测器里还剩什么？</strong>
+        <strong>「粗定位 + 细回归」的编码方式</strong>（中心点归一化 + 宽高 log）、
+        <strong>IoU 驱动的样本分配</strong>、<strong>难例挖掘 → OHEM → Focal Loss</strong> 的思想、
+        以及<strong>NMS</strong> 本身。变的是特征共享方式与损失函数，不变的是这套问题分解。</li>
+      </ol>
+    </section>
+
+    <!-- ================= 11 ================= -->
+    <section id="s11">
+      <h2><span class="num">11</span>代码实战：把每一步写出来</h2>
+      <p class="lead">
+        理解检测器最快的方式是亲手实现里面的每个算子。下面四个函数覆盖了 R-CNN 全部「有计算逻辑」的部分，
+        加起来不到 80 行，但每一个都对应前文的一个步骤。
+      </p>
+
+      <h3>11.1 完整流程：从候选框到最终结果</h3>
+      <pre><code><span class="kw">import</span> numpy <span class="kw">as</span> np
+
+<span class="cm"># ---------- 步骤 ⑤：边框回归的编码与解码 ----------</span>
+<span class="kw">def</span> <span class="fn">encode_bbox</span>(P, G):
+    <span class="st">"""P, G: (x, y, w, h)。返回式 6-1 的四元组 t = (tx, ty, tw, th)"""</span>
+    Px, Py, Pw, Ph = P
+    Gx, Gy, Gw, Gh = G
+    <span class="kw">return</span> np.array([
+        (Gx - Px) / Pw,          <span class="cm"># 中心点横向偏移，按宽归一化</span>
+        (Gy - Py) / Ph,          <span class="cm"># 中心点纵向偏移，按高归一化</span>
+        np.log(Gw / Pw),         <span class="cm"># 宽度取 log 比</span>
+        np.log(Gh / Ph),         <span class="cm"># 高度取 log 比</span>
+    ])
+
+<span class="kw">def</span> <span class="fn">decode_bbox</span>(P, d):
+    <span class="st">"""P: (x, y, w, h)，d: (dx, dy, dw, dh)。返回式 6-2 修正后的框"""</span>
+    Px, Py, Pw, Ph = P
+    dx, dy, dw, dh = d
+    <span class="kw">return</span> np.array([
+        Pw * dx + Px,            <span class="cm"># 注意：偏移量要乘回 Pw，而不是加</span>
+        Ph * dy + Py,
+        Pw * np.exp(dw),         <span class="cm"># log 空间的反解是指数</span>
+        Ph * np.exp(dh),
+    ])
+
+<span class="cm"># ---------- 步骤 ⑥：IoU 与贪心 NMS ----------</span>
+<span class="kw">def</span> <span class="fn">iou_matrix</span>(A, B):
+    <span class="st">"""A: (N,4), B: (M,4)，格式均为 xyxy（左上、右下）"""</span>
+    lt = np.maximum(A[:, <span class="kw">None</span>, :<span class="st">2</span>], B[<span class="kw">None</span>, :, :<span class="st">2</span>])   <span class="cm"># 左上取大</span>
+    rb = np.minimum(A[:, <span class="kw">None</span>, <span class="st">2</span>:], B[<span class="kw">None</span>, :, <span class="st">2</span>:])   <span class="cm"># 右下取小</span>
+    wh = np.clip(rb - lt, <span class="st">0</span>, <span class="kw">None</span>)                    <span class="cm"># 负值截断为 0</span>
+    inter = wh[..., <span class="st">0</span>] * wh[..., <span class="st">1</span>]
+    area_a = np.prod(A[:, <span class="st">2</span>:] - A[:, :<span class="st">2</span>], axis=<span class="st">1</span>)
+    area_b = np.prod(B[:, <span class="st">2</span>:] - B[:, :<span class="st">2</span>], axis=<span class="st">1</span>)
+    <span class="kw">return</span> inter / (area_a[:, <span class="kw">None</span>] + area_b[<span class="kw">None</span>, :] - inter + <span class="st">1e-9</span>)
+
+<span class="kw">def</span> <span class="fn">nms</span>(boxes, scores, thr=<span class="st">0.3</span>):
+    <span class="st">"""类内贪心 NMS —— R-CNN 用 thr=0.3"""</span>
+    order = scores.argsort()[::-<span class="st">1</span>]
+    keep = []
+    <span class="kw">while</span> order.size &gt; <span class="st">0</span>:
+        i = order[<span class="st">0</span>]
+        keep.append(i)
+        <span class="kw">if</span> order.size == <span class="st">1</span>:
+            <span class="kw">break</span>
+        ious = iou_matrix(boxes[i:i+<span class="st">1</span>], boxes[order[<span class="st">1</span>:]])[<span class="st">0</span>]
+        order = order[<span class="st">1</span>:][ious &lt;= thr]     <span class="cm"># 超过阈值的一律抑制</span>
+    <span class="kw">return</span> np.array(keep)
+
+<span class="cm"># ---------- 把整条链路串起来 ----------</span>
+<span class="kw">def</span> <span class="fn">rcnn_infer</span>(image, proposal_fn, cnn_fn, svms, regressors,
+               K=<span class="st">2000</span>, p=<span class="st">16</span>, nms_thr=<span class="st">0.3</span>):
+    proposals = proposal_fn(image)[:K]                 <span class="cm"># ① 候选区域</span>
+
+    patches = []
+    <span class="kw">for</span> b <span class="kw">in</span> proposals:
+        patch = crop_with_context(image, b, p)         <span class="cm"># ② 扩展 p 并补均值像素</span>
+        patch = resize_anisotropic(patch, <span class="st">227</span>, <span class="st">227</span>)    <span class="cm">#    各向异性缩放</span>
+        patches.append(normalize(patch))               <span class="cm">#    BGR + 均值减法</span>
+
+    feats = cnn_fn(np.stack(patches))                  <span class="cm"># ③ 逐框前向，取 fc7 / pool5</span>
+    fc7, pool5 = feats[<span class="st">'fc7'</span>], feats[<span class="st">'pool5'</span>]
+
+    scores = np.stack([svm(fc7) <span class="kw">for</span> svm <span class="kw">in</span> svms], axis=<span class="st">1</span>)   <span class="cm"># ④ 21 个 SVM 打分</span>
+
+    results = []
+    <span class="kw">for</span> c, reg <span class="kw">in</span> <span class="fn">enumerate</span>(regressors):            <span class="cm"># ⑤ 逐类回归 + ⑥ 逐类 NMS</span>
+        refined = np.stack([decode_bbox(b, reg(f)) <span class="kw">for</span> b, f <span class="kw">in</span> <span class="fn">zip</span>(proposals, pool5)])
+        s = scores[:, c]
+        <span class="kw">for</span> i <span class="kw">in</span> nms(xywh_to_xyxy(refined), s, nms_thr):
+            results.append((c, s[i], *refined[i]))
+    <span class="kw">return</span> results</code></pre>
+
+      <h3>11.2 用现有框架跑（对照理解）</h3>
+      <p class="small">
+        R-CNN 本身没有维护良好的现代实现，实际工程里用的是它的后代。但你可以用 torchvision 的算子
+        直接验证本文的每个公式——尤其 <code>roi_align</code> / <code>roi_pool</code> / <code>nms</code> 这三个。
+      </p>
+      <pre><code><span class="kw">import</span> torch, torchvision
+<span class="kw">from</span> torchvision.ops <span class="kw">import</span> nms, roi_align, roi_pool, box_iou
+
+<span class="cm"># 验证 IoU 与 NMS（对应步骤 ⑥）</span>
+boxes  = torch.tensor([[<span class="st">0.</span>, <span class="st">0.</span>, <span class="st">100.</span>, <span class="st">100.</span>], [<span class="st">10.</span>, <span class="st">10.</span>, <span class="st">110.</span>, <span class="st">110.</span>], [<span class="st">200.</span>, <span class="st">200.</span>, <span class="st">300.</span>, <span class="st">300.</span>]])
+scores = torch.tensor([<span class="st">0.9</span>, <span class="st">0.8</span>, <span class="st">0.7</span>])
+<span class="fn">print</span>(box_iou(boxes, boxes))              <span class="cm"># 自己算的 IoU 应与之一致</span>
+<span class="fn">print</span>(nms(boxes, scores, <span class="st">0.3</span>))             <span class="cm"># R-CNN 的阈值：0.3</span>
+
+<span class="cm"># 验证 RoI Pooling 与 ROIAlign 的差异（这是 Fast/Mask R-CNN 的核心）</span>
+feat = torch.randn(<span class="st">1</span>, <span class="st">256</span>, <span class="st">32</span>, <span class="st">32</span>)               <span class="cm"># 模拟 stride=16 的特征图</span>
+rois = torch.tensor([[<span class="st">0.</span>, <span class="st">10.</span>, <span class="st">20.</span>, <span class="st">210.</span>, <span class="st">220.</span>]])    <span class="cm"># 原图坐标 (batch_idx, x1, y1, x2, y2)</span>
+a = roi_pool(feat,  rois, output_size=(<span class="st">7</span>, <span class="st">7</span>), spatial_scale=<span class="st">1</span>/<span class="st">16</span>)   <span class="cm"># 两次量化取整</span>
+b = roi_align(feat, rois, output_size=(<span class="st">7</span>, <span class="st">7</span>), spatial_scale=<span class="st">1</span>/<span class="st">16</span>,
+              sampling_ratio=<span class="st">2</span>, aligned=<span class="kw">True</span>)                      <span class="cm"># 双线性插值，无量化</span>
+<span class="fn">print</span>((a - b).abs().mean())                <span class="cm"># 这就是量化误差造成的影响</span></code></pre>
+      <div class="callout warn">
+        <span class="t">注意 <code>aligned=True</code></span>
+        <p>torchvision 的 <code>roi_align</code> 默认 <code>aligned=False</code>，此时坐标语义与原始论文略有偏差。
+        Mask R-CNN 的实现使用 <code>aligned=True</code>，会把 RoI 坐标整体平移 −0.5 以避免半像素偏移。
+        生产代码里忘记这个参数，通常造成 0.5~1 个点的精度损失。</p>
+      </div>
+    </section>
+
+    <!-- ================= 12 ================= -->
+    <section id="s12">
+      <h2><span class="num">12</span>自测题</h2>
+      <p class="lead">点击选项立即判分并给出解析。全部答对说明这六步你已经吃透了。</p>
+      <div id="quiz"></div>
+      <div id="quiz-score-wrap"><span class="t">得分</span><p id="quiz-score">尚未作答。</p></div>
+
+      <footer class="site">
+        <p>
+          本页只讲 R-CNN 一个模型的每一步细节。数字与超参来自原论文
+          <em>Rich feature hierarchies for accurate object detection and semantic segmentation</em>（Girshick et al., CVPR 2014）
+          及 Selective Search（Uijlings et al., IJCV 2013）；工程实现细节以官方代码与主流复现为准。
+        </p>
+      </footer>
+    </section>
+  </main>
+</div>
+
+<script src="../assets/site.js"></script>
+<script src="../assets/rcnn.js"></script>
+</body>
+</html>

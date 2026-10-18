@@ -1,0 +1,1387 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ISP 管线逐步详解 · 从光子到 YUV</title>
+<meta name="description" content="ISP（Image Signal Processor）管线逐步拆解：光子→电子→DN 的成像物理、黑电平/暗角/坏点校正、去马赛克、白平衡、色彩校正矩阵、Gamma 与色调映射、YUV 域增强、3A 闭环。含 6 个可交互演示与逐级对比。">
+<link rel="stylesheet" href="../assets/styles.css">
+<style>
+  /* 本页局部修正：让滑块的文字与控件各占一行，避免被挤成竖排 */
+  .ctrl label { flex-wrap: wrap; row-gap: 2px; }
+  .ctrl label input[type=range] { flex: 1 0 100%; margin-top: 2px; }
+  .ctrl label b { margin-left: auto; }
+</style>
+</head>
+<body>
+<div id="progress"></div>
+
+<div class="topbar">
+  <div class="brand">ISP 管线 <span>逐步详解</span></div>
+  <nav id="topnav">
+    <a href="#s1">总览</a>
+    <a href="#s2">RAW</a>
+    <a href="#s3">RAW 校正</a>
+    <a href="#s4">去马赛克</a>
+    <a href="#s5">白平衡</a>
+    <a href="#s6">CCM/Gamma</a>
+    <a href="#s7">YUV</a>
+    <a href="#s8">3A</a>
+    <a href="#s9">工程</a>
+    <a href="#s10">速查</a>
+  </nav>
+</div>
+
+<div class="wrap">
+  <aside class="toc">
+    <h4>本页目录</h4>
+    <ol id="tocList">
+      <li><a href="#s1">ISP 到底在解决什么问题</a></li>
+      <li><a href="#s2">从光子到 RAW：成像物理</a></li>
+      <li><a href="#s3">RAW 域校正：BLC / LSC / DPCC / NR</a></li>
+      <li><a href="#s4">去马赛克：颜色是猜出来的</a></li>
+      <li><a href="#s5">白平衡：谁说了算「白」</a></li>
+      <li><a href="#s6">CCM 与 Gamma：从传感器到显示器</a></li>
+      <li><a href="#s7">YUV 域：人眼决定的重心</a></li>
+      <li><a href="#s8">3A 闭环：AE / AWB / AF</a></li>
+      <li><a href="#s9">工程实践：RAW 还是 YUV</a></li>
+      <li><a href="#s10">速查表、自测与出处</a></li>
+    </ol>
+  </aside>
+
+  <main>
+    <header class="hero">
+      <span class="kicker">IMAGE SIGNAL PROCESSOR · RAW → YUV</span>
+      <h1>ISP 管线 <em>逐步详解</em></h1>
+      <p class="sub">
+        一颗摄像头从光子打到像素上，到你能在屏幕上看到一张「正常」的照片，中间隔着一整套流水线。
+        本页按<strong>数据真正流过的顺序</strong>拆开它：每一步的输入域（线性 / 感知）、为什么必须放在这个位置、
+        跳过它会看到什么、以及工程上最容易踩的坑。所有示意图与本页演示均为本地生成，不依赖任何网络资源。
+      </p>
+      <div class="meta">
+        <span>10 章</span>
+        <span>6 个交互演示</span>
+        <span>RAW 12/14 bit → YUV 8/10 bit</span>
+        <span>含 3A 闭环</span>
+      </div>
+      <div class="callout warn" style="margin-top:18px">
+        <span class="t">关于「依据」</span>
+        <p>
+          本页原计划依据知乎专栏 <code>c_1389227246742335488</code> 编写，但该专栏与其文章对未登录抓取一律返回
+          <strong>HTTP 403</strong>，因此<strong>未能核对原文</strong>。正文改由可公开访问的一手资料支撑：
+          Bayer 专利、Malvar/Hamilton-Adams 去马赛克论文、sRGB / BT.709 标准、ARM Mali-C71 等 ISP 白皮书、
+          Buchsbaum 灰度世界与 Land Retinex 等原始文献。每章末尾列出处；属于工程经验而非文献结论的，都明确标注。
+        </p>
+      </div>
+    </header>
+
+    <!-- ================= 1 ================= -->
+    <section id="s1">
+      <h2><span class="num">01</span>ISP 到底在解决什么问题</h2>
+      <p class="lead">
+        <strong>sensor 只会输出一张单通道、带噪、含黑电平偏置、带暗角、每个像素只有一种颜色的数字图像</strong>；
+        而人眼、显示器、编码器、算法要的是<strong>三通道、白平衡正确、色彩与人眼一致、按感知均匀分配的图像</strong>。
+        ISP 就是这条「把传感器语言翻译成人眼语言」的流水线。它不是可选的图像增强，而是<strong>重建</strong>。
+      </p>
+
+      <figure>
+        <svg viewBox="0 0 1140 420" role="img" aria-label="ISP 管线全链路方框图，标出线性域与感知域的边界以及 3A 反馈">
+          <defs>
+            <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="#7c88a8"></path>
+            </marker>
+            <marker id="ar2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="#ffb454"></path>
+            </marker>
+            <linearGradient id="pk" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0" stop-color="#1b2a52"></stop><stop offset="1" stop-color="#111a35"></stop>
+            </linearGradient>
+            <linearGradient id="pk2" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0" stop-color="#2a2347"></stop><stop offset="1" stop-color="#1a1631"></stop>
+            </linearGradient>
+          </defs>
+
+          <!-- 域底色 -->
+          <rect x="104" y="42" width="812" height="196" rx="14" fill="rgba(76,201,240,.06)" stroke="rgba(76,201,240,.25)"></rect>
+          <text x="120" y="64" fill="#4cc9f0" font-size="12.5" font-weight="700">线性域（信号 ∝ 光强）</text>
+          <rect x="920" y="42" width="196" height="196" rx="14" fill="rgba(181,123,255,.06)" stroke="rgba(181,123,255,.25)"></rect>
+          <text x="936" y="64" fill="#b57bff" font-size="12.5" font-weight="700">感知域（码值）</text>
+
+          <g font-size="12.5">
+            <!-- 光学 -->
+            <rect x="120" y="86" width="130" height="120" rx="12" fill="url(#pk)" stroke="#26304f"></rect>
+            <text x="185" y="112" text-anchor="middle" fill="#e8edf9" font-size="14" font-weight="700">光学</text>
+            <text x="185" y="136" text-anchor="middle" fill="#aab6d4" font-size="11.5">镜头 · IR-cut · 微透镜</text>
+            <text x="185" y="158" text-anchor="middle" fill="#7c88a8" font-size="11">PSF / 暗角 / 色差</text>
+            <text x="185" y="180" text-anchor="middle" fill="#7c88a8" font-size="11">在这里就已经丢信息</text>
+
+            <!-- sensor -->
+            <rect x="268" y="86" width="164" height="120" rx="12" fill="url(#pk)" stroke="#2b65a0"></rect>
+            <text x="350" y="112" text-anchor="middle" fill="#4cc9f0" font-size="14" font-weight="700">Sensor</text>
+            <text x="350" y="136" text-anchor="middle" fill="#aab6d4" font-size="11.5">光电转换 → CFA → ADC</text>
+            <text x="350" y="158" text-anchor="middle" fill="#e8edf9" font-size="12">RAW 1ch · 10/12/14 bit</text>
+            <text x="350" y="180" text-anchor="middle" fill="#7c88a8" font-size="11">散粒噪声 / 读出噪声</text>
+
+            <!-- RAW 校正 -->
+            <rect x="450" y="86" width="150" height="120" rx="12" fill="url(#pk)" stroke="#2b65a0"></rect>
+            <text x="525" y="112" text-anchor="middle" fill="#4cc9f0" font-size="14" font-weight="700">RAW 校正</text>
+            <text x="525" y="134" text-anchor="middle" fill="#aab6d4" font-size="11.5">BLC · LSC · DPCC</text>
+            <text x="525" y="152" text-anchor="middle" fill="#aab6d4" font-size="11.5">RAW 域降噪</text>
+            <text x="525" y="176" text-anchor="middle" fill="#7c88a8" font-size="11">必须线性、必须在插值前</text>
+
+            <!-- demosaic -->
+            <rect x="618" y="86" width="132" height="120" rx="12" fill="url(#pk)" stroke="#2b65a0"></rect>
+            <text x="684" y="112" text-anchor="middle" fill="#4cc9f0" font-size="14" font-weight="700">去马赛克</text>
+            <text x="684" y="136" text-anchor="middle" fill="#aab6d4" font-size="11.5">1ch → 3ch</text>
+            <text x="684" y="158" text-anchor="middle" fill="#e8edf9" font-size="12">RAW → RGB</text>
+            <text x="684" y="180" text-anchor="middle" fill="#7c88a8" font-size="11">伪彩 / 拉链伪影源头</text>
+
+            <!-- AWB + CCM -->
+            <rect x="768" y="86" width="140" height="120" rx="12" fill="url(#pk2)" stroke="#6b4fa0"></rect>
+            <text x="838" y="112" text-anchor="middle" fill="#b57bff" font-size="14" font-weight="700">AWB + CCM</text>
+            <text x="838" y="136" text-anchor="middle" fill="#aab6d4" font-size="11.5">白平衡增益 → 3×3 矩阵</text>
+            <text x="838" y="158" text-anchor="middle" fill="#e8edf9" font-size="12">仍在线性域</text>
+            <text x="838" y="180" text-anchor="middle" fill="#7c88a8" font-size="11">顺序反了色彩收不回</text>
+
+            <!-- gamma -->
+            <rect x="926" y="86" width="132" height="120" rx="12" fill="url(#pk2)" stroke="#6b4fa0"></rect>
+            <text x="992" y="112" text-anchor="middle" fill="#b57bff" font-size="14" font-weight="700">Gamma/色调</text>
+            <text x="992" y="136" text-anchor="middle" fill="#aab6d4" font-size="11.5">线性光 → 码值</text>
+            <text x="992" y="158" text-anchor="middle" fill="#e8edf9" font-size="12">8/10 bit</text>
+            <text x="992" y="180" text-anchor="middle" fill="#7c88a8" font-size="11">此步之后不再是线性</text>
+          </g>
+
+          <!-- 域边界 -->
+          <line x1="917" y1="42" x2="917" y2="238" stroke="#ffb454" stroke-width="2" stroke-dasharray="6 5"></line>
+          <text x="917" y="262" text-anchor="middle" fill="#ffb454" font-size="12" font-weight="700">域边界（Gamma）</text>
+          <text x="917" y="282" text-anchor="middle" fill="#7c88a8" font-size="11">跨过去不可逆：之后所有运算都按「码值」思维做</text>
+
+          <!-- 主链箭头 -->
+          <g stroke="#7c88a8" stroke-width="1.6" marker-end="url(#ar)">
+            <line x1="250" y1="146" x2="264" y2="146"></line>
+            <line x1="432" y1="146" x2="446" y2="146"></line>
+            <line x1="600" y1="146" x2="614" y2="146"></line>
+            <line x1="750" y1="146" x2="764" y2="146"></line>
+            <line x1="908" y1="146" x2="922" y2="146"></line>
+          </g>
+          <text x="992" y="222" text-anchor="middle" fill="#aab6d4" font-size="11">YUV 4:2:0 → 编码 / 显示 / 送算法</text>
+
+          <!-- 3A 反馈 -->
+          <path d="M 350 206 L 350 320 L 185 320 L 185 210" fill="none" stroke="#ffb454" stroke-width="1.6" stroke-dasharray="7 5" marker-end="url(#ar2)"></path>
+          <text x="268" y="336" text-anchor="middle" fill="#ffb454" font-size="12" font-weight="700">3A 闭环</text>
+          <text x="268" y="354" text-anchor="middle" fill="#aab6d4" font-size="11.5">AE 调曝光/增益 · AWB 调 R/B 增益 · AF 调对焦马达</text>
+          <text x="268" y="376" text-anchor="middle" fill="#7c88a8" font-size="11">反馈量来自「处理后的图」，调的是「传感器与镜头」——闭环会互相耦合</text>
+          <text x="268" y="398" text-anchor="middle" fill="#7c88a8" font-size="11">例：AE 加减曝光会让 AWB 重新收敛；AF 一动，镜头阴影与色差都变</text>
+        </svg>
+        <figcaption>图 1-1　典型 ISP 管线：左侧全部在线性域，中间一次跨域，右侧全在感知域。3A 是套在外面的反馈环，不属于数据通路。</figcaption>
+      </figure>
+
+      <h3>四个必须记住的结论</h3>
+      <div class="grid c2">
+        <div class="card">
+          <span class="tag">01</span>
+          <h4>顺序不是随便定的</h4>
+          <p>决定顺序的是<strong>「这一步要求输入处于什么域」</strong>：线性域的噪声模型简单、增益可交换；一旦跨过 Gamma，噪声从加性变乘性。所以凡是能在线性域做的校正（BLC、LSC、DPCC、RAW 降噪、AWB、CCM）都必须挤在 Gamma 之前。</p>
+        </div>
+        <div class="card">
+          <span class="tag">02</span>
+          <h4>插值之前先修坏数据</h4>
+          <p>去马赛克会把<strong>一个像素的错误扩散到周围多个像素</strong>。所以坏点校正、黑电平、暗角必须在 demosaic 之前完成——这一点决定了 RAW 校正段的整体位置。</p>
+        </div>
+        <div class="card">
+          <span class="tag">03</span>
+          <h4>ISP 是重建，不是滤镜</h4>
+          <p>你看到的「颜色」有 2/3 是插值猜出来的。去马赛克本质是<strong>逆问题</strong>：缺失的通道要靠邻域的先验补。所以它天然会产生伪彩与拉链伪影，好的算法就是在「补得准」与「不造假」之间取舍。</p>
+        </div>
+        <div class="card">
+          <span class="tag">04</span>
+          <h4>它决定了算法的输入分布</h4>
+          <p>同一场景换一颗 sensor、换一版 ISP 固件、调一次 tuning 参数，模型的输入分布就变了。<strong>「训练用图与上线用图必须来自同一条 ISP 链路」</strong>不是洁癖，是工业与车载项目里最常见的线上事故来源。</p>
+        </div>
+      </div>
+
+      <div class="callout">
+        <span class="t">怎么读这一页</span>
+        <p>每章都按同一结构：<strong>这一步在干什么 → 数学定义 → 为什么必须在这里 → 跳过会怎样 → 工程坑</strong>。带 ▶ 的深色面板是可以动手的演示；所有演示都是本页现算的，不读任何外部图片。如果你只有十分钟，直接跳到 <a href="#s10">第 10 章速查表</a>。</p>
+      </div>
+    </section>
+
+    <!-- ================= 2 ================= -->
+    <section id="s2">
+      <h2><span class="num">02</span>从光子到 RAW：成像物理</h2>
+      <p class="lead">
+        想讲清 ISP 的每一步为什么存在，得先知道<strong>它拿到的数据到底长什么样</strong>：一个被光子散粒噪声、读出噪声、暗电流、黑电平偏置、镜头暗角共同污染的、每像素只有一种颜色的整数矩阵。
+        这一章只做一件事——把这个「脏」说清楚。
+      </p>
+
+      <h3>2.1　一个像素的剖面</h3>
+
+      <figure>
+        <svg viewBox="0 0 1140 330" role="img" aria-label="CMOS 像素剖面：微透镜、彩色滤光片、遮光层、光电二极管与读出电路">
+          <defs>
+            <linearGradient id="si" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0" stop-color="#2a3350"></stop><stop offset="1" stop-color="#161d33"></stop>
+            </linearGradient>
+            <marker id="arr3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="#4cc9f0"></path>
+            </marker>
+          </defs>
+
+          <!-- 入射光 -->
+          <g stroke="#4cc9f0" stroke-width="1.4" marker-end="url(#arr3)">
+            <line x1="96" y1="14" x2="112" y2="52"></line>
+            <line x1="170" y1="14" x2="176" y2="52"></line>
+            <line x1="244" y1="14" x2="240" y2="52"></line>
+          </g>
+          <text x="276" y="20" fill="#4cc9f0" font-size="11.5">入射光</text>
+
+          <!-- 微透镜 -->
+          <path d="M 60 60 Q 170 22 280 60 L 280 72 L 60 72 Z" fill="rgba(76,201,240,.22)" stroke="#4cc9f0" stroke-width="1.4"></path>
+          <!-- 平坦化层 -->
+          <rect x="56" y="72" width="224" height="14" fill="rgba(255,255,255,.05)" stroke="#26304f"></rect>
+          <!-- CFA -->
+          <rect x="96" y="86" width="42" height="24" fill="rgba(61,220,151,.45)" stroke="#3ddc97"></rect>
+          <rect x="138" y="86" width="42" height="24" fill="rgba(255,107,129,.45)" stroke="#ff6b81"></rect>
+          <rect x="180" y="86" width="42" height="24" fill="rgba(123,140,255,.45)" stroke="#7b8cff"></rect>
+          <text x="117" y="103" text-anchor="middle" fill="#08210f" font-size="11" font-weight="700">G</text>
+          <text x="159" y="103" text-anchor="middle" fill="#2a0810" font-size="11" font-weight="700">R</text>
+          <text x="201" y="103" text-anchor="middle" fill="#0a0f2a" font-size="11" font-weight="700">B</text>
+          <!-- 遮光层 -->
+          <rect x="56" y="110" width="224" height="10" fill="#41506e"></rect>
+          <!-- 硅衬底 -->
+          <rect x="56" y="120" width="224" height="150" fill="url(#si)" stroke="#26304f"></rect>
+          <!-- 光电二极管 -->
+          <rect x="96" y="140" width="148" height="66" rx="6" fill="rgba(76,201,240,.18)" stroke="#4cc9f0" stroke-dasharray="4 3"></rect>
+          <text x="170" y="166" text-anchor="middle" fill="#bfe9fb" font-size="11.5" font-weight="700">光电二极管</text>
+          <text x="170" y="184" text-anchor="middle" fill="#8fb6d8" font-size="10">光子 → 电子-空穴对</text>
+          <text x="170" y="199" text-anchor="middle" fill="#8fb6d8" font-size="10">FWC 决定上限</text>
+          <!-- 读出 -->
+          <rect x="96" y="214" width="148" height="20" rx="4" fill="rgba(255,180,84,.12)" stroke="#ffb454"></rect>
+          <text x="170" y="228" text-anchor="middle" fill="#ffd9a0" font-size="10">电荷→电压→放大→ADC</text>
+
+          <!-- 左侧标注 -->
+          <g font-size="11.5" fill="#aab6d4">
+            <text x="300" y="56" fill="#e8edf9" font-weight="600">微透镜：把斜入射光折进感光区</text>
+            <text x="300" y="78" fill="#7c88a8">平坦化层 / 抗反射</text>
+            <text x="300" y="100" fill="#e8edf9" font-weight="600">CFA：每个像素只透过一种颜色</text>
+            <text x="300" y="122" fill="#7c88a8">所以 RAW 天生只有 1 个通道</text>
+            <text x="300" y="144" fill="#e8edf9" font-weight="600">遮光层：挡住斜射光</text>
+            <text x="300" y="166" fill="#7c88a8">否则会串色、对比度下降</text>
+            <text x="300" y="188" fill="#e8edf9" font-weight="600">光电二极管：光子 → 电子</text>
+            <text x="300" y="210" fill="#7c88a8">满阱 FWC 决定动态范围上限</text>
+            <text x="300" y="232" fill="#e8edf9" font-weight="600">读出：电荷 → 电压 → ADC</text>
+          </g>
+
+          <!-- 右侧：三层损失 -->
+          <g font-size="11.5">
+            <text x="700" y="36" fill="#e8edf9" font-size="13" font-weight="700">三层信息损失，都发生在 ISP 之前</text>
+            <text x="700" y="62" fill="#aab6d4">① 光学：PSF 模糊、暗角 cos⁴、色差</text>
+            <text x="700" y="84" fill="#aab6d4">② 采样：Bayer 欠采样，每像素丢 2 个分量</text>
+            <text x="700" y="106" fill="#aab6d4">③ 噪声：散粒噪声（相关）+ 读出噪声</text>
+
+            <text x="700" y="142" fill="#e8edf9" font-size="13" font-weight="700">所以输出永远不等于「真实场景」</text>
+            <text x="700" y="166" fill="#aab6d4">它是在信息已损失的前提下做的重建：</text>
+            <text x="700" y="188" fill="#aab6d4">锐化放大噪声、降噪抹掉细节、</text>
+            <text x="700" y="210" fill="#aab6d4">AWB 改颜色、色调映射压动态范围。</text>
+          </g>
+
+          <rect x="700" y="232" width="420" height="86" rx="10" fill="rgba(255,180,84,.07)" stroke="rgba(255,180,84,.35)"></rect>
+          <text x="716" y="256" fill="#ffb454" font-size="12" font-weight="700">对算法的直接含义</text>
+          <text x="716" y="278" fill="#aab6d4" font-size="11.5">厂商 ISP 的降噪/锐化是为「好看」优化的，</text>
+          <text x="716" y="300" fill="#aab6d4" font-size="11.5">会破坏微小缺陷、低对比纹理与暗部细节。</text>
+        </svg>
+        <figcaption>图 2-1　CMOS 像素剖面。右侧三行是关键：光学、采样、噪声都发生在 ISP 拿到数据之前，ISP 只能补偿、不能恢复。</figcaption>
+      </figure>
+
+      <h3>2.2　Bayer 阵列：为什么是 2×2 里 2 个绿</h3>
+
+      <p>
+        Bayer 在 1976 年的专利里给出的方案是：每个像素前放一片滤光片，2×2 单元里放 <strong>1 个 R、1 个 B、2 个 G</strong>。
+        绿色多一倍的原因是<strong>人眼的亮度感知主要由中波（M）锥细胞贡献，峰值在 555 nm 附近，与 G 通道的通过带高度重合</strong>；
+        把采样率最高的位置留给最影响「清晰度」的通道，是最划算的交换。
+      </p>
+
+      <figure>
+        <svg viewBox="0 0 1140 250" role="img" aria-label="Bayer 四种排列 RGGB、BGGR、GRBG、GBRG 的 4×4 矩阵">
+          <g font-size="11">
+            <!-- 生成 4 个 4x4 网格 -->
+            <g>
+              <text x="40" y="26" fill="#e8edf9" font-size="13" font-weight="700">RGGB</text>
+              <text x="40" y="44" fill="#7c88a8" font-size="11">最常见</text>
+            </g>
+            <g>
+              <text x="310" y="26" fill="#e8edf9" font-size="13" font-weight="700">BGGR</text>
+              <text x="310" y="44" fill="#7c88a8" font-size="11">RGGB 旋转 180°</text>
+            </g>
+            <g>
+              <text x="580" y="26" fill="#e8edf9" font-size="13" font-weight="700">GRBG</text>
+              <text x="580" y="44" fill="#7c88a8" font-size="11">RGGB 水平镜像</text>
+            </g>
+            <g>
+              <text x="850" y="26" fill="#e8edf9" font-size="13" font-weight="700">GBRG</text>
+              <text x="850" y="44" fill="#7c88a8" font-size="11">RGGB 垂直镜像</text>
+            </g>
+
+            <!-- RGGB: rows R G / G B -->
+            <g transform="translate(40,60)">
+              <rect x="0" y="0" width="46" height="46" fill="rgba(255,107,129,.35)" stroke="#26304f"></rect><text x="23" y="30" text-anchor="middle" fill="#ffb3bf" font-weight="700">R</text>
+              <rect x="46" y="0" width="46" height="46" fill="rgba(61,220,151,.30)" stroke="#26304f"></rect><text x="69" y="30" text-anchor="middle" fill="#9df0c6" font-weight="700">G</text>
+              <rect x="92" y="0" width="46" height="46" fill="rgba(255,107,129,.35)" stroke="#26304f"></rect><text x="115" y="30" text-anchor="middle" fill="#ffb3bf" font-weight="700">R</text>
+              <rect x="138" y="0" width="46" height="46" fill="rgba(61,220,151,.30)" stroke="#26304f"></rect><text x="161" y="30" text-anchor="middle" fill="#9df0c6" font-weight="700">G</text>
+
+              <rect x="0" y="46" width="46" height="46" fill="rgba(61,220,151,.30)" stroke="#26304f"></rect><text x="23" y="76" text-anchor="middle" fill="#9df0c6" font-weight="700">G</text>
+              <rect x="46" y="46" width="46" height="46" fill="rgba(123,140,255,.35)" stroke="#26304f"></rect><text x="69" y="76" text-anchor="middle" fill="#bcc5ff" font-weight="700">B</text>
+              <rect x="92" y="46" width="46" height="46" fill="rgba(61,220,151,.30)" stroke="#26304f"></rect><text x="115" y="76" text-anchor="middle" fill="#9df0c6" font-weight="700">G</text>
+              <rect x="138" y="46" width="46" height="46" fill="rgba(123,140,255,.35)" stroke="#26304f"></rect><text x="161" y="76" text-anchor="middle" fill="#bcc5ff" font-weight="700">B</text>
+            </g>
+
+            <!-- BGGR -->
+            <g transform="translate(310,60)">
+              <rect x="0" y="0" width="46" height="46" fill="rgba(123,140,255,.35)" stroke="#26304f"></rect><text x="23" y="30" text-anchor="middle" fill="#bcc5ff" font-weight="700">B</text>
+              <rect x="46" y="0" width="46" height="46" fill="rgba(61,220,151,.30)" stroke="#26304f"></rect><text x="69" y="30" text-anchor="middle" fill="#9df0c6" font-weight="700">G</text>
+              <rect x="92" y="0" width="46" height="46" fill="rgba(123,140,255,.35)" stroke="#26304f"></rect><text x="115" y="30" text-anchor="middle" fill="#bcc5ff" font-weight="700">B</text>
+              <rect x="138" y="0" width="46" height="46" fill="rgba(61,220,151,.30)" stroke="#26304f"></rect><text x="161" y="30" text-anchor="middle" fill="#9df0c6" font-weight="700">G</text>
+              <rect x="0" y="46" width="46" height="46" fill="rgba(61,220,151,.30)" stroke="#26304f"></rect><text x="23" y="76" text-anchor="middle" fill="#9df0c6" font-weight="700">G</text>
+              <rect x="46" y="46" width="46" height="46" fill="rgba(255,107,129,.35)" stroke="#26304f"></rect><text x="69" y="76" text-anchor="middle" fill="#ffb3bf" font-weight="700">R</text>
+              <rect x="92" y="46" width="46" height="46" fill="rgba(61,220,151,.30)" stroke="#26304f"></rect><text x="115" y="76" text-anchor="middle" fill="#9df0c6" font-weight="700">G</text>
+              <rect x="138" y="46" width="46" height="46" fill="rgba(255,107,129,.35)" stroke="#26304f"></rect><text x="161" y="76" text-anchor="middle" fill="#ffb3bf" font-weight="700">R</text>
+            </g>
+
+            <!-- GRBG -->
+            <g transform="translate(580,60)">
+              <rect x="0" y="0" width="46" height="46" fill="rgba(61,220,151,.30)" stroke="#26304f"></rect><text x="23" y="30" text-anchor="middle" fill="#9df0c6" font-weight="700">G</text>
+              <rect x="46" y="0" width="46" height="46" fill="rgba(255,107,129,.35)" stroke="#26304f"></rect><text x="69" y="30" text-anchor="middle" fill="#ffb3bf" font-weight="700">R</text>
+              <rect x="92" y="0" width="46" height="46" fill="rgba(61,220,151,.30)" stroke="#26304f"></rect><text x="115" y="30" text-anchor="middle" fill="#9df0c6" font-weight="700">G</text>
+              <rect x="138" y="0" width="46" height="46" fill="rgba(255,107,129,.35)" stroke="#26304f"></rect><text x="161" y="30" text-anchor="middle" fill="#ffb3bf" font-weight="700">R</text>
+              <rect x="0" y="46" width="46" height="46" fill="rgba(123,140,255,.35)" stroke="#26304f"></rect><text x="23" y="76" text-anchor="middle" fill="#bcc5ff" font-weight="700">B</text>
+              <rect x="46" y="46" width="46" height="46" fill="rgba(61,220,151,.30)" stroke="#26304f"></rect><text x="69" y="76" text-anchor="middle" fill="#9df0c6" font-weight="700">G</text>
+              <rect x="92" y="46" width="46" height="46" fill="rgba(123,140,255,.35)" stroke="#26304f"></rect><text x="115" y="76" text-anchor="middle" fill="#bcc5ff" font-weight="700">B</text>
+              <rect x="138" y="46" width="46" height="46" fill="rgba(61,220,151,.30)" stroke="#26304f"></rect><text x="161" y="76" text-anchor="middle" fill="#9df0c6" font-weight="700">G</text>
+            </g>
+
+            <!-- GBRG -->
+            <g transform="translate(850,60)">
+              <rect x="0" y="0" width="46" height="46" fill="rgba(61,220,151,.30)" stroke="#26304f"></rect><text x="23" y="30" text-anchor="middle" fill="#9df0c6" font-weight="700">G</text>
+              <rect x="46" y="0" width="46" height="46" fill="rgba(123,140,255,.35)" stroke="#26304f"></rect><text x="69" y="30" text-anchor="middle" fill="#bcc5ff" font-weight="700">B</text>
+              <rect x="92" y="0" width="46" height="46" fill="rgba(61,220,151,.30)" stroke="#26304f"></rect><text x="115" y="30" text-anchor="middle" fill="#9df0c6" font-weight="700">G</text>
+              <rect x="138" y="0" width="46" height="46" fill="rgba(123,140,255,.35)" stroke="#26304f"></rect><text x="161" y="30" text-anchor="middle" fill="#bcc5ff" font-weight="700">B</text>
+              <rect x="0" y="46" width="46" height="46" fill="rgba(255,107,129,.35)" stroke="#26304f"></rect><text x="23" y="76" text-anchor="middle" fill="#ffb3bf" font-weight="700">R</text>
+              <rect x="46" y="46" width="46" height="46" fill="rgba(61,220,151,.30)" stroke="#26304f"></rect><text x="69" y="76" text-anchor="middle" fill="#9df0c6" font-weight="700">G</text>
+              <rect x="92" y="46" width="46" height="46" fill="rgba(255,107,129,.35)" stroke="#26304f"></rect><text x="115" y="76" text-anchor="middle" fill="#ffb3bf" font-weight="700">R</text>
+              <rect x="138" y="46" width="46" height="46" fill="rgba(61,220,151,.30)" stroke="#26304f"></rect><text x="161" y="76" text-anchor="middle" fill="#9df0c6" font-weight="700">G</text>
+            </g>
+
+            <text x="40" y="200" fill="#7c88a8" font-size="11.5">四种排列只是相位不同，处理时靠一个 2 bit 的相位参数区分。</text>
+            <text x="40" y="220" fill="#aab6d4" font-size="11.5">工程坑：相位读错 → 红蓝互换（肤色发青/发红），是最常见的 bring-up 错误之一。</text>
+          </g>
+        </svg>
+        <figcaption>图 2-2　Bayer 四种相位。它们互为旋转/镜像，算法上只差一个起始位；但相位错了输出颜色立刻不对。</figcaption>
+      </figure>
+
+      <div class="demo">
+        <div class="demo-title">演示 1 · 亲手数一遍 Bayer：采样、相位与「丢失的通道」</div>
+        <p class="demo-hint">切换相位、拖动放大倍数；点击任意格子可以看它属于哪个通道、在 2×2 单元里的位置。右侧是这张图真正的 RAW（单通道）长什么样。</p>
+        <div class="demo-grid">
+          <canvas id="d1-canvas" height="360" aria-label="Bayer 阵列与 RAW 采样演示"></canvas>
+          <div class="ctrl">
+            <label>相位
+              <select id="d1-phase">
+                <option value="rggb">RGGB</option>
+                <option value="bggr">BGGR</option>
+                <option value="grbg">GRBG</option>
+                <option value="gbrg">GBRG</option>
+              </select>
+            </label>
+            <label>放大（像素/格）<b id="d1-zoomv">14</b>
+              <input type="range" id="d1-zoom" min="6" max="26" step="1" value="14">
+            </label>
+            <div class="readout" id="d1-info">
+              <div><span>点击位置</span><span>—</span></div>
+              <div><span>通道</span><span>—</span></div>
+              <div><span>在 2×2 中</span><span>—</span></div>
+            </div>
+            <div class="legend">
+              <span><i style="background:#ff6b81"></i>R</span>
+              <span><i style="background:#3ddc97"></i>G</span>
+              <span><i style="background:#7b8cff"></i>B</span>
+            </div>
+            <p class="small muted" style="margin:0">关键体会：一个 2×2 单元只有 4 个采样值，却要还原 12 个通道值。信息缺口不是靠插值「补全」，而是靠假设「局部颜色相关」猜出来的。</p>
+          </div>
+        </div>
+      </div>
+
+      <h3>2.3　噪声：为什么 ISO 拉高就脏</h3>
+
+      <p>传感器输出可以写成一条很朴素的链路（单位：电子 e⁻）：</p>
+
+      <div class="formula">
+        <span class="lbl">式 2-1</span>
+        N<sub>e</sub> = Φ · QE · t<sub>exp</sub> + N<sub>dark</sub>　　（信号电子数 = 入射光子数 × 量子效率 × 曝光时间 + 暗电流）
+      </div>
+      <div class="formula">
+        <span class="lbl">式 2-2</span>
+        σ<sub>total</sub> = √(N<sub>e</sub> + σ<sub>read</sub>²)　　（散粒噪声是泊松过程，方差 = 均值）
+      </div>
+      <div class="formula">
+        <span class="lbl">式 2-3</span>
+        SNR = N<sub>e</sub> / √(N<sub>e</sub> + σ<sub>read</sub>²)　　⇒ 亮处 SNR ≈ √N<sub>e</sub>，暗处 SNR ≈ N<sub>e</sub>/σ<sub>read</sub>
+      </div>
+
+      <p>
+        式 2-3 是理解一切噪声问题的钥匙：<strong>亮处是「散粒噪声受限」，SNR 只按 √N 增长；暗处是「读出噪声受限」，SNR 与信号成正比</strong>。
+        拉高 ISO 的本质是<strong>在模拟/数字域乘增益</strong>，信号与噪声一起被放大 —— 所以 ISO 越高噪点越明显，但这不是「增益产生噪声」，
+        而是<strong>暗部本来就有的读出噪声被你放大了，同时高光更早饱和、动态范围变窄</strong>。
+      </p>
+
+      <div class="demo">
+        <div class="demo-title">演示 2 · 噪声模型：曝光、读出噪声、增益与动态范围</div>
+        <p class="demo-hint">左图是一块均匀灰板经过 sensor + ADC 后的样子（放大显示）；右图是光子传递曲线（PTC）。拖动滑块看 SNR 与 DR 怎么变。</p>
+        <div class="demo-grid">
+          <canvas id="d2-canvas" height="330" aria-label="传感器噪声与光子传递曲线演示"></canvas>
+          <div class="ctrl">
+            <label>曝光（电子数）<b id="d2-expv">4000</b>
+              <input type="range" id="d2-exp" min="20" max="12000" step="20" value="4000">
+            </label>
+            <label>读出噪声 σ<sub>r</sub>（e⁻）<b id="d2-readv">3.0</b>
+              <input type="range" id="d2-read" min="0.5" max="30" step="0.5" value="3">
+            </label>
+            <label>ISO 增益<b id="d2-gainv">1.0×</b>
+              <input type="range" id="d2-gain" min="1" max="16" step="0.5" value="1">
+            </label>
+            <div class="readout" id="d2-readout">
+              <div><span>满阱 FWC</span><span>—</span></div>
+              <div><span>SNR（增益后）</span><span>—</span></div>
+              <div><span>等价 ISO</span><span>—</span></div>
+              <div><span>动态范围</span><span>—</span></div>
+              <div><span>受限机制</span><span>—</span></div>
+            </div>
+            <p class="small muted" style="margin:0">注意 SNR 在「增益前」不变、在「增益后」下降 —— 因为 ADC 之后的高光已经裁掉了。这正是「高 ISO 不如长曝光」的量化解释。</p>
+          </div>
+        </div>
+      </div>
+
+      <h3>2.4　黑电平与量化：为什么 RAW 里「黑」不是 0</h3>
+
+      <p>
+        光电二极管在完全无光时仍有<strong>暗电流</strong>与<strong>读出电路的偏置</strong>；为了不把「零信号」附近的噪声裁掉（裁掉就会系统性低估暗部），
+        厂商会在 ADC 输出上加一个固定的偏置，叫<strong>黑电平（black level / OB pedestal）</strong>。
+        sensor 边缘通常有一圈<strong>光学黑区（OB, optical black）</strong>——被遮光但结构相同的像素，专门用来实时估计这个偏置与暗电流的温度漂移。
+      </p>
+
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>量</th><th>典型量级</th><th>说明</th><th>出处</th></tr></thead>
+          <tbody>
+            <tr><td>满阱 FWC</td><td>消费级约 2k–10k e⁻；大像素工业传感器更高</td><td>决定动态范围上限，与像素面积、工艺有关</td><td class="neu">量级，随器件差异大（未逐型号核对）</td></tr>
+            <tr><td>读出噪声</td><td>现代 CMOS 约 1–5 e⁻ rms；早期/高速读出可达 10 e⁻ 以上</td><td>决定暗部 SNR 与 DR 下界</td><td class="neu">量级（未逐型号核对）</td></tr>
+            <tr><td>量子效率 QE</td><td>约 40%–70%（峰值波长处）</td><td>光子转电子的比例，含 CFA 与微透镜后的整体值</td><td class="neu">量级（未逐型号核对）</td></tr>
+            <tr><td>黑电平偏置</td><td>10-bit 常见 64 DN；12-bit 常见 240–256 DN</td><td>由厂商定义，随增益档位变化，必须逐档标定</td><td class="neu">工程惯例值，非标准</td></tr>
+            <tr><td>ADC 位宽</td><td>10 / 12 / 14 bit</td><td>先保证不裁切，再由 ISP 降到 8/10 bit 输出</td><td class="neu">产品规格</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout warn">
+        <span class="t">一个反直觉的点：黑电平不是常数</span>
+        <p>
+          它随<strong>模拟增益档位</strong>与<strong>温度</strong>变化。所以 BLC 的典型实现是：每档增益各存一个基准值 + 用 OB 区实时测量做温度补偿。
+          如果只写死一个常数，高增益下会出现「全黑区域发灰」或「暗部发紫」——这是 bring-up 阶段最常见的画面问题之一。
+        </p>
+      </div>
+
+      <div class="callout ok">
+        <span class="t">本章一句话</span>
+        <p>RAW 不是「未处理的照片」，而是<strong>一份带偏置、带暗角、带噪声、每像素只有一种颜色的测量记录</strong>。ISP 后面每一步都在替这份记录还债。</p>
+      </div>
+    </section>
+
+    <!-- ================= 3 ================= -->
+    <section id="s3">
+      <h2><span class="num">03</span>RAW 域校正：BLC / LSC / DPCC / NR</h2>
+      <p class="lead">
+        这一段全部在<strong>线性域、单通道、插值之前</strong>完成。顺序有硬约束：<strong>黑电平 → 暗角 → 坏点 → 降噪 → 去马赛克</strong>。
+        理由只有一句：去马赛克会把单像素误差扩散成多个像素的彩色错误，所以任何「修单点」的事都必须抢在它前面。
+      </p>
+
+      <h3>3.1　黑电平校正 BLC</h3>
+      <div class="formula">
+        <span class="lbl">式 3-1</span>
+        DN<sub>out</sub> = max(0, DN<sub>in</sub> − BL(g, T))　　（g 为模拟增益档位，T 为温度；BL 由 OB 区实时估计 + 逐档标定表）
+      </div>
+      <p>
+        为什么必须减：后续所有校正（暗角增益、白平衡增益、CCM）都是<strong>乘性/线性假设</strong>。
+        如果「黑」不是 0，那么乘一个增益之后黑位被一起放大，白平衡就会改变暗部的色调；去马赛克也会在黑区附近插出彩色斑块。
+        <strong>减法不做，后面所有乘法的语义都是错的。</strong>
+      </p>
+
+      <h3>3.2　镜头阴影校正 LSC</h3>
+      <p>
+        暗角的物理来源有两条：<strong>余弦四次方定律</strong>（离轴光通量按 cos⁴θ 衰减，薄透镜近似）与<strong>像素的斜入射效率下降</strong>（微透镜与滤光片对斜光收集不足，叫 pixel vignetting / crosstalk）。
+        结果是画面四角比中心暗，而且<strong>R/G/B 三通道的衰减还不一样</strong>（因为滤光片的入射角特性不同），所以暗角不只是亮度问题，还带<strong>色偏</strong>。
+      </p>
+
+      <figure>
+        <svg viewBox="0 0 1140 250" role="img" aria-label="余弦四次方暗角曲线与增益补偿网格">
+          <g>
+            <!-- 左：cos^4 曲线 -->
+            <text x="20" y="24" fill="#e8edf9" font-size="13" font-weight="700">离轴衰减（薄透镜近似，cos⁴θ）</text>
+            <line x1="40" y1="190" x2="330" y2="190" stroke="#26304f"></line>
+            <line x1="40" y1="60" x2="40" y2="190" stroke="#26304f"></line>
+            <text x="188" y="214" text-anchor="middle" fill="#7c88a8" font-size="11">视场角 θ</text>
+            <text x="18" y="60" fill="#7c88a8" font-size="11" text-anchor="end">1.0</text>
+            <text x="18" y="190" fill="#7c88a8" font-size="11" text-anchor="end">0</text>
+
+            <!-- 曲线：y = 190 − 130·cos⁴θ，θ = 0..45° -->
+            <polyline fill="none" stroke="#4cc9f0" stroke-width="2"
+              points="40,60 72,62 104,67.7 137,76.8 169,88.6 201,102.3 233,116.9 266,131.5 298,145.2 330,157.5"></polyline>
+            <text x="238" y="108" fill="#4cc9f0" font-size="11.5">θ=30° → 0.56</text>
+            <text x="262" y="176" fill="#ffb454" font-size="11.5">θ=45° → 0.25</text>
+            <text x="40" y="236" fill="#7c88a8" font-size="11">cos⁴30° = 0.5625，cos⁴45° = 0.25：四角只剩 1/4 的光，必须乘 4 倍补回</text>
+          </g>
+
+          <g transform="translate(400,0)">
+            <text x="20" y="24" fill="#e8edf9" font-size="13" font-weight="700">补偿方式：一张「增益图」，不是一条曲线</text>
+            <text x="20" y="48" fill="#aab6d4" font-size="12">因为真实暗角还叠加了色偏与装配误差，所以实现是逐通道、逐网格的增益查找表：</text>
+            <text x="20" y="72" fill="#4cc9f0" font-size="12" font-family="ui-monospace, Consolas, monospace">DN_out(x,y) = DN_in(x,y) × G_c(mesh_x, mesh_y)　c ∈ {R,G,B}</text>
+            <text x="20" y="96" fill="#aab6d4" font-size="12">网格常见 16×12 / 32×24 / 64×48，节点间双线性插值；节点越密越准，存储越大。</text>
+
+            <!-- 网格示意 -->
+            <g transform="translate(24,116)">
+              <rect x="0" y="0" width="300" height="110" rx="8" fill="#0a0f1e" stroke="#26304f"></rect>
+              <g stroke="#1e2740" stroke-width="1">
+                <line x1="0" y1="27.5" x2="300" y2="27.5"></line><line x1="0" y1="55" x2="300" y2="55"></line><line x1="0" y1="82.5" x2="300" y2="82.5"></line>
+                <line x1="50" y1="0" x2="50" y2="110"></line><line x1="100" y1="0" x2="100" y2="110"></line><line x1="150" y1="0" x2="150" y2="110"></line>
+                <line x1="200" y1="0" x2="200" y2="110"></line><line x1="250" y1="0" x2="250" y2="110"></line>
+              </g>
+              <rect x="110" y="35" width="80" height="40" rx="4" fill="rgba(76,201,240,.25)" stroke="#4cc9f0"></rect>
+              <text x="150" y="60" text-anchor="middle" fill="#bfe9fb" font-size="11">中心 G≈1</text>
+              <circle cx="12" cy="12" r="6" fill="rgba(255,107,129,.4)" stroke="#ff6b81"></circle>
+              <text x="24" y="16" fill="#ffb3bf" font-size="10.5">角 G≈2.5–4</text>
+              <text x="150" y="128" text-anchor="middle" fill="#7c88a8" font-size="11">网格节点存增益，像素位置双线性插值取值</text>
+            </g>
+
+            <rect x="350" y="116" width="330" height="110" rx="8" fill="rgba(255,180,84,.07)" stroke="rgba(255,180,84,.35)"></rect>
+            <text x="366" y="140" fill="#ffb454" font-size="12" font-weight="700">代价：噪声被一起放大</text>
+            <text x="366" y="162" fill="#aab6d4" font-size="11.5">σ_out = G · σ_in。四角乘 4 倍，噪声标准差也 ×4</text>
+            <text x="366" y="182" fill="#aab6d4" font-size="11.5">（方差 ×16）。所以边角看起来更「脏」是数学必然。</text>
+            <text x="366" y="204" fill="#aab6d4" font-size="11.5">补偿力度与噪声之间必须折中，这也是 tuning 的活儿。</text>
+          </g>
+        </svg>
+        <figcaption>图 3-1　暗角是「光」的问题，补偿是「乘增益」的问题；而乘增益必然放大噪声与色偏的残留。</figcaption>
+      </figure>
+
+      <h3>3.3　坏点校正 DPCC</h3>
+      <p>
+        坏点有两类：<strong>死点（dead pixel，几乎不响应）</strong>与<strong>热点（hot pixel，暗电流异常大，长曝光尤其明显）</strong>。
+        主流做法是先标定出一张<strong>坏点表</strong>（出厂标定 + 现场高温/长曝光下重新标定），运行时按表定点替换；再用「同通道邻域一致性检验」兜住漂移出来的动态坏点。
+      </p>
+      <div class="callout">
+        <span class="t">为什么不能直接上中值滤波</span>
+        <p>
+          盲目的中值/均值滤波<strong>会把所有细节一起抹掉</strong>，而且会把「真实的点状目标」当坏点删掉——工业检测里这是致命的。
+          正确做法是<strong>用坏点表定点校正</strong>，只动已知坏点；只有表覆盖不到时才启用基于邻域的检测，且检测阈值要随增益（噪声水平）自适应。
+        </p>
+      </div>
+
+      <h3>3.4　RAW 域降噪：为什么抢在去马赛克之前</h3>
+      <p>
+        线性域的噪声是<strong>加性、与信号相关的泊松噪声 + 近高斯的读出噪声</strong>，可以用式 2-2 精确建模；一旦乘上白平衡增益、做 CCM、过 Gamma，
+        噪声就变成<strong>乘性、与码值相关</strong>，模型变复杂、参数随场景漂移。
+        所以在 RAW 上先降一次噪，是「用最干净的噪声模型做最有效的去噪」。
+      </p>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>做法</th><th>域</th><th>优点</th><th>代价 / 风险</th></tr></thead>
+          <tbody>
+            <tr><td>RAW 域降噪（bilateral / NLM / 引导滤波）</td><td>线性、单通道</td><td>噪声模型简单、抑制效果最彻底；<strong>避免去马赛克放大噪声</strong></td><td>需要在 CFA 上做同通道邻域，算力大；过度会破坏高频细节，去马赛克失去可用信息</td></tr>
+            <tr><td>YUV 域降噪（Y 轻、UV 重）</td><td>感知域</td><td>贴着人眼特性做，算力友好，可与编码协同</td><td>此时噪声已被增益与 Gamma 整形，抑制不彻底；对暗部细节已造成不可逆损失</td></tr>
+            <tr><td>时域降噪（TNR / MFNR）</td><td>任一</td><td>多帧平均可把随机噪声按 √N 压下去</td><td>运动物体拖影/鬼影；需要运动检测或配准</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="small muted">
+        出处：双边滤波 Tomasi &amp; Manduchi, ICCV 1998；非局部均值 Buades et al., CVPR 2005；噪声模型与光子传递 Janesick, <em>Photon Transfer</em> (SPIE, 2007)；ISP 模块顺序参见 ARM Mali-C71 ISP 白皮书与 Ramanath et al., "Color image processing pipeline", <em>IEEE Signal Processing Magazine</em>, 2005。
+      </p>
+    </section>
+
+    <!-- ================= 4 ================= -->
+    <section id="s4">
+      <h2><span class="num">04</span>去马赛克：颜色是猜出来的</h2>
+      <p class="lead">
+        这是整条管线里<strong>唯一一个真正的逆问题</strong>：已知每个像素 1 个通道，要恢复 3 个通道，缺失量是 2/3。
+        没有额外先验就无解；所有算法都在用同一个先验——<strong>局部区域内不同通道的高频是相关的</strong>（颜色变化比亮度变化慢）。
+      </p>
+
+      <h3>4.1　三种层次的解法</h3>
+      <div class="grid c3">
+        <div class="card">
+          <span class="tag">线性 · 双线性</span>
+          <h4>邻域平均</h4>
+          <p>缺 R 就用周围 R 平均，缺 G 就用周围 4 个 G 平均。最简单、最快，但<strong>在边缘处会把两种颜色混在一起</strong>，产生彩色锯齿（zipper）与伪彩（false color）。</p>
+        </div>
+        <div class="card">
+          <span class="tag">线性 · 梯度修正</span>
+          <h4>Malvar-He-Cutler</h4>
+          <p>在双线性基础上用<strong>拉普拉斯修正项</strong>补高频：先由同位置的其他通道估计亮度，再把高频加回缺失通道。5×5 线性核，效果显著好于双线性，仍是很多 ISP 的默认档。</p>
+        </div>
+        <div class="card">
+          <span class="tag">非线性 · 自适应</span>
+          <h4>方向自适应 / 学习型</h4>
+          <p>先判断边缘方向（水平/垂直），只沿边缘方向插值（Hamilton-Adams、VNG、方向滤波+LMMSE）；再往上就是 CNN 去马赛克，手机 ISP 已普遍使用。</p>
+        </div>
+      </div>
+
+      <p>
+        Malvar 的贡献值得单独看一眼：它不是「更聪明的插值」，而是<strong>把「G 通道的高频 ≈ 亮度高频」当成约束写进线性核</strong>。
+        以「在 R 位置估 G」为例，5×5 核为：
+      </p>
+
+      <figure>
+        <svg viewBox="0 0 1140 210" role="img" aria-label="Malvar-He-Cutler 5x5 卷积核：在 R 位置估计 G，与在 B 位置估计 R">
+          <g font-size="11">
+            <text x="30" y="22" fill="#e8edf9" font-size="13" font-weight="700">① 在 R 位置估 G（除以 8）</text>
+            <g transform="translate(30,36)">
+              <rect x="0" y="0" width="180" height="180" fill="#0a0f1e" stroke="#26304f"></rect>
+              <g font-family="ui-monospace, Consolas, monospace" font-size="12" text-anchor="middle">
+                <text x="18" y="26" fill="#7c88a8">0</text><text x="54" y="26" fill="#7c88a8">0</text><text x="90" y="26" fill="#ff6b81">-1</text><text x="126" y="26" fill="#7c88a8">0</text><text x="162" y="26" fill="#7c88a8">0</text>
+                <text x="18" y="62" fill="#7c88a8">0</text><text x="54" y="62" fill="#7c88a8">0</text><text x="90" y="62" fill="#3ddc97">2</text><text x="126" y="62" fill="#7c88a8">0</text><text x="162" y="62" fill="#7c88a8">0</text>
+                <text x="18" y="98" fill="#ff6b81">-1</text><text x="54" y="98" fill="#3ddc97">2</text><text x="90" y="98" fill="#fff" font-weight="700">4</text><text x="126" y="98" fill="#3ddc97">2</text><text x="162" y="98" fill="#ff6b81">-1</text>
+                <text x="18" y="134" fill="#7c88a8">0</text><text x="54" y="134" fill="#7c88a8">0</text><text x="90" y="134" fill="#3ddc97">2</text><text x="126" y="134" fill="#7c88a8">0</text><text x="162" y="134" fill="#7c88a8">0</text>
+                <text x="18" y="170" fill="#7c88a8">0</text><text x="54" y="170" fill="#7c88a8">0</text><text x="90" y="170" fill="#ff6b81">-1</text><text x="126" y="170" fill="#7c88a8">0</text><text x="162" y="170" fill="#7c88a8">0</text>
+              </g>
+            </g>
+            <text x="230" y="60" fill="#aab6d4" font-size="11.5">中心 4：保留本像素的高频</text>
+            <text x="230" y="82" fill="#aab6d4" font-size="11.5">±2 的 G：提供亮度参考</text>
+            <text x="230" y="104" fill="#aab6d4" font-size="11.5">−1 的同行 R：抵消低频、只留高频修正</text>
+            <text x="230" y="126" fill="#7c88a8" font-size="11.5">核内权重和为 8，所以整体除以 8。</text>
+            <text x="230" y="150" fill="#7c88a8" font-size="11.5">这个核在平坦区退化为「取最近的 G」，在边缘处才修正。</text>
+
+            <text x="600" y="22" fill="#e8edf9" font-size="13" font-weight="700">② 在 B 位置估 R（除以 8）</text>
+            <g transform="translate(600,36)">
+              <rect x="0" y="0" width="180" height="180" fill="#0a0f1e" stroke="#26304f"></rect>
+              <g font-family="ui-monospace, Consolas, monospace" font-size="12" text-anchor="middle">
+                <text x="18" y="26" fill="#7c88a8">0</text><text x="54" y="26" fill="#7c88a8">0</text><text x="90" y="26" fill="#ff6b81">-1.5</text><text x="126" y="26" fill="#7c88a8">0</text><text x="162" y="26" fill="#7c88a8">0</text>
+                <text x="18" y="62" fill="#7c88a8">0</text><text x="54" y="62" fill="#3ddc97">2</text><text x="90" y="62" fill="#7c88a8">0</text><text x="126" y="62" fill="#3ddc97">2</text><text x="162" y="62" fill="#7c88a8">0</text>
+                <text x="18" y="98" fill="#ff6b81">-1.5</text><text x="54" y="98" fill="#7c88a8">0</text><text x="90" y="98" fill="#fff" font-weight="700">6</text><text x="126" y="98" fill="#7c88a8">0</text><text x="162" y="98" fill="#ff6b81">-1.5</text>
+                <text x="18" y="134" fill="#7c88a8">0</text><text x="54" y="134" fill="#3ddc97">2</text><text x="90" y="134" fill="#7c88a8">0</text><text x="126" y="134" fill="#3ddc97">2</text><text x="162" y="134" fill="#7c88a8">0</text>
+                <text x="18" y="170" fill="#7c88a8">0</text><text x="54" y="170" fill="#7c88a8">0</text><text x="90" y="170" fill="#ff6b81">-1.5</text><text x="126" y="170" fill="#7c88a8">0</text><text x="162" y="170" fill="#7c88a8">0</text>
+              </g>
+            </g>
+            <text x="800" y="60" fill="#aab6d4" font-size="11.5">中心 6 + 对角 −1.5：用对角 B 与邻域 G 同时约束</text>
+            <text x="800" y="82" fill="#aab6d4" font-size="11.5">这就是「梯度修正」——不是插值，是把已知通道</text>
+            <text x="800" y="104" fill="#aab6d4" font-size="11.5">的高频借给缺失通道。</text>
+            <text x="800" y="132" fill="#7c88a8" font-size="11.5">出处：Malvar, He, Cutler, ICASSP 2004。</text>
+          </g>
+        </svg>
+        <figcaption>图 4-1　Malvar-He-Cutler 的两个 5×5 核（数值取自原论文）。线性、可分块并行，所以至今仍是 ISP 的性价比之选。</figcaption>
+      </figure>
+
+      <h3>4.2　伪彩与拉链伪影：失败长什么样</h3>
+      <div class="grid c2">
+        <div class="card">
+          <h4>伪彩 false color</h4>
+          <p>高频黑白条纹（栅栏、织物、窗户格）被三种颜色的采样率差异「拍频」，插值后出现<strong>实际不存在的彩色条纹</strong>。本质是<strong>欠采样导致的混叠</strong>，与 demosaic 算法好坏无关——只要还是 Bayer，就一定存在。</p>
+        </div>
+        <div class="card">
+          <h4>拉链 zipper</h4>
+          <p>边缘两侧的通道插值结果不一致，导致边缘像拉链一样出现明暗交替的锯齿。方向自适应算法主要就是在治它：<strong>沿边缘方向插值，而不是跨边缘平均</strong>。</p>
+        </div>
+      </div>
+
+      <div class="demo">
+        <div class="demo-title">演示 3 · 三种去马赛克同台竞技（含 PSNR）</div>
+        <p class="demo-hint">同一张 RAW 分别用双线性、Malvar 5×5、方向自适应重建，最左是「真值」（场景先经过一道轻微镜头模糊，作为带宽受限的基准）。拖动噪声滑块看算法退化。PSNR 是相对真值实时算的。</p>
+        <div class="demo-grid">
+          <canvas id="d3-canvas" height="330" aria-label="三种去马赛克算法对比演示"></canvas>
+          <div class="ctrl">
+            <label>RAW 噪声 σ（DN，12 bit）<b id="d3-noisev">2</b>
+              <input type="range" id="d3-noise" min="0" max="30" step="1" value="2">
+            </label>
+            <div class="readout" id="d3-readout">
+              <div><span>双线性 PSNR</span><span>—</span></div>
+              <div><span>Malvar PSNR</span><span>—</span></div>
+              <div><span>方向自适应 PSNR</span><span>—</span></div>
+              <div><span>伪彩最重的位置</span><span>—</span></div>
+            </div>
+            <p class="small muted" style="margin:0">
+              两个常见误解：<strong>①</strong> PSNR 高不等于好看——噪声大时双线性的模糊反而压住了伪彩，人眼看可能更舒服；
+              <strong>②</strong> 噪声越大，Malvar 的高频修正越会把噪声当细节放大（可以拖到 30 DN 看它反超）。
+              这正是<strong>RAW 域降噪必须排在去马赛克之前</strong>的原因。
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <div class="callout warn">
+        <span class="t">对算法工程师的实际含义</span>
+        <p>
+          如果你的任务是<strong>检测/测量</strong>而不是「拍好看」：去马赛克引入的伪彩会影响基于颜色的阈值、条纹会影响亚像素边缘定位。
+          这类场景要么<strong>关掉/弱化 ISP 的彩噪抑制与锐化</strong>，要么<strong>直接取 RAW 自己做统一的预处理</strong>——后者在多相机一致性上收益最大，代价是没有现成预训练模型、数据量变成 1 通道（Bayer）或 3 倍（拆成三平面）。
+        </p>
+      </div>
+
+      <p class="small muted">
+        出处：Bayer, "Color imaging array", US Patent 3,971,065 (1976)；Hamilton &amp; Adams, US Patent 5,629,734 (1997)；Malvar, He, Cutler, "High-quality linear interpolation for demosaicing of Bayer-patterned color images", ICASSP 2004；Zhang &amp; Wu, "Color demosaicking via directional linear minimum mean square-error estimation", IEEE TIP 2005；学习型方法综述见 Gharbi et al., "Deep joint demosaicking and denoising", SIGGRAPH Asia 2016。
+      </p>
+    </section>
+
+    <!-- ================= 5 ================= -->
+    <section id="s5">
+      <h2><span class="num">05</span>白平衡：谁说了算「白」</h2>
+      <p class="lead">
+        白平衡要解决的是一个<strong>病态问题</strong>：传感器测到的是「物体反射率 × 光源光谱」的乘积，两者都未知。
+        AWB 只能依赖一个假设——<strong>「这个场景里平均而言应该是灰的」或「场景里最亮的点应该是白的」</strong>。
+        假设一破，就是偏色。
+      </p>
+
+      <h3>5.1　为什么只需要两个增益</h3>
+      <p>
+        白平衡的自由度是 <strong>2</strong>：把 G 通道增益固定为 1，只调 R 与 B。原因很直接——<strong>整体亮度归 AE 管</strong>，
+        AWB 只负责「色彩中性」，一个 3 维增益里乘性重叠的那一维（整体缩放）交给 AE 更合理。所以 AWB 的输出永远是 <code>(g_R, 1, g_B)</code> 这样一对数字。
+      </p>
+      <div class="formula">
+        <span class="lbl">式 5-1</span>
+        [R′, G′, B′] = [g<sub>R</sub>·R, G, g<sub>B</sub>·B]，其中 g<sub>R</sub>, g<sub>B</sub> 由「使场景中的中性色满足 R′ = G′ = B′」解出
+      </div>
+      <p>
+        必须强调：<strong>增益要乘在线性域，而且要在 CCM 之前</strong>。CCM 是按「已经白平衡到某个白点」的假设标定的；顺序反了，
+        相当于在一个基准已经错的坐标系里做色彩变换，偏色再也收不回来（这一点在第 6 章还会再讲一次）。
+      </p>
+
+      <h3>5.2　三种经典假设，各自的死法</h3>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>方法</th><th>假设</th><th>怎么做</th><th>典型失效场景</th><th>出处</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>灰度世界 gray world</td>
+              <td>整个场景的平均反射率是中性灰</td>
+              <td>令 ∫R = ∫G = ∫B，得 g<sub>R</sub> = mean(G)/mean(R)，g<sub>B</sub> = mean(G)/mean(B)</td>
+              <td><strong>单色主导场景</strong>：大片绿草地、红色墙面、蓝天占 70% 画面 → 把整幅图推向互补色</td>
+              <td>Buchsbaum, 1980</td>
+            </tr>
+            <tr>
+              <td>白点法 white patch / max-RGB</td>
+              <td>场景中最亮的点是白（或镜面高光）</td>
+              <td>取各通道的高分位数（如 99%），令其相等：g<sub>R</sub> = max<sub>q</sub>(G)/max<sub>q</sub>(R)</td>
+              <td>画面里没有白色/高光（夜景、暗室）；或最亮处是有色光源本身 → 过冲</td>
+              <td>Land, Retinex, 1977</td>
+            </tr>
+            <tr>
+              <td>Shades-of-Gray（p 范数）</td>
+              <td>Minkowski 范数意义下场景平均是灰</td>
+              <td>g<sub>c</sub> = (mean(R^p))^(1/p) 形式，p=1 退化为灰度世界，p→∞ 退化为白点法</td>
+              <td>p 需要按场景选；仍然怕大面积单色</td>
+              <td>Finlayson &amp; Trezzi, 2004</td>
+            </tr>
+            <tr>
+              <td>色域映射 / 相关性</td>
+              <td>光源色温落在已知先验集合里</td>
+              <td>用大量光源下的训练样本构造「图像统计量 → 光源」的映射（色域映射、贝叶斯、CNN）</td>
+              <td>需要标定数据；跨域（手机→工业）迁移差</td>
+              <td>Finlayson et al. 2001；Bianco et al. 2017（CNN）</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="demo">
+        <div class="demo-title">演示 4 · 同一场景换光源：三种 AWB 谁先崩</div>
+        <p class="demo-hint">左图是「sensor 看到的」（光源未校正），右侧可切换 AWB 方法。中间那张彩色卡片是中性灰参考——它的 R/G/B 应当相等。切换光源与画面内容，观察灰度世界在单色场景里如何翻车。</p>
+        <div class="demo-grid">
+          <canvas id="d4-canvas" height="340" aria-label="白平衡方法对比演示"></canvas>
+          <div class="ctrl">
+            <label>光源
+              <select id="d4-illum">
+                <option value="d65">日光 D65（≈6500K）</option>
+                <option value="tungsten">钨丝灯（≈2800K）</option>
+                <option value="shade">阴影/蓝调（≈8000K）</option>
+                <option value="green">荧光灯偏绿</option>
+              </select>
+            </label>
+            <label>场景
+              <select id="d4-scene">
+                <option value="mixed">混合场景（有灰卡）</option>
+                <option value="green">大面积绿（草地）</option>
+                <option value="red">大面积红（砖墙）</option>
+              </select>
+            </label>
+            <label>方法
+              <select id="d4-method">
+                <option value="gray" selected>灰度世界</option>
+                <option value="none">不校正</option>
+                <option value="white">白点法（99%）</option>
+                <option value="manual">手动增益</option>
+                <option value="truth">理想（已知光源）</option>
+              </select>
+            </label>
+            <label>手动 R 增益 <b id="d4-rv">1.00</b>
+              <input type="range" id="d4-r" min="0.4" max="2.6" step="0.02" value="1">
+            </label>
+            <label>手动 B 增益 <b id="d4-bv">1.00</b>
+              <input type="range" id="d4-b" min="0.4" max="2.6" step="0.02" value="1">
+            </label>
+            <div class="readout" id="d4-readout">
+              <div><span>灰卡 R/G/B</span><span>—</span></div>
+              <div><span>灰卡残留色偏</span><span>—</span></div>
+              <div><span>全图 R/B 均值比</span><span>—</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="callout bad">
+        <span class="t">工程上最贵的三个坑</span>
+        <p>
+          <strong>① 时序抖动</strong>：AWB 增益必须做平滑（低通/限速），否则从室内走到室外会看到画面「颜色扫过一遍」。<br>
+          <strong>② 增益放大噪声</strong>：钨丝灯下 g<sub>B</sub> 常常要 2–3 倍，蓝通道噪声同比放大，暗部出蓝斑；所以 AWB 之后通常紧跟色度降噪。<br>
+          <strong>③ 混合光源</strong>：窗边（日光）+ 室内（钨丝）根本没有全局解。高端 ISP 会做<strong>分区 AWB</strong>（按网格估计、平滑融合），代价是可能出现「色块感」。
+        </p>
+      </div>
+    </section>
+
+    <!-- ================= 6 ================= -->
+    <section id="s6">
+      <h2><span class="num">06</span>CCM 与 Gamma：从传感器到显示器</h2>
+      <p class="lead">
+        AWB 解决「白是不是白」，CCM 解决「红是不是红」，Gamma 解决「暗部能不能看出层次」。
+        三者都在<strong>线性域</strong>完成（Gamma 是<strong>离开</strong>线性域的那一步）。
+      </p>
+
+      <h3>6.1　色彩校正矩阵 CCM</h3>
+      <p>
+        sensor 的光谱响应<strong>不是</strong>人眼的三刺激值曲线，滤光片之间还有串扰。所以「相机 RGB」是一个<strong>设备相关</strong>的颜色空间，
+        必须用一个变换把它映射到目标空间（sRGB / Rec.709 / 显示器的原生空间）。最常用的就是 3×3 矩阵（有时带偏移项，变成 3×4）：
+      </p>
+      <div class="formula">
+        <span class="lbl">式 6-1</span>
+        [R<sub>out</sub>, G<sub>out</sub>, B<sub>out</sub>]<sup>T</sup> = <b>M</b><sub>3×3</sub> · [R<sub>in</sub>, G<sub>in</sub>, B<sub>in</sub>]<sup>T</sup> + <b>o</b>
+      </div>
+      <p>
+        标定方法很朴素：拍一张<strong>标准色卡</strong>（如 24 色卡）在已知光源下，把每个色块的「相机响应」与「标准色卡标称值」配对，
+        用<strong>最小二乘</strong>解出 <b>M</b>；实际工程会加两个约束——<strong>行和≈1</strong>（保证中性色不被矩阵改变）与<strong>非负/温和</strong>（防止矩阵把噪声放大或产生不可能的负光）。
+      </p>
+
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>问题</th><th>原因</th><th>工程做法</th></tr></thead>
+          <tbody>
+            <tr><td>为什么不能直接用「色彩空间转换矩阵」</td><td>那是两个<strong>标准空间</strong>之间的固定变换（如 sRGB→Rec.2020）；而相机 RGB 没有标准定义</td><td>CCM 必须是<strong>逐型号、逐光源点</strong>标定的</td></tr>
+            <tr><td>换光源要不要换矩阵</td><td>不同光谱下相机响应不同，同一矩阵会有残余色差</td><td>按 AWB 的色温区间存多组矩阵，按增益插值（矩阵插值不能直接线性插值元素，常在对数域或通过分解插值）</td></tr>
+            <tr><td>负系数怎么处理</td><td>光谱响应重叠导致逆变换出现负值</td><td>允许小幅负值（提升饱和度）；幅度过大时会放大噪声、产生「紫边」</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>6.2　Gamma：为什么必须离开线性域</h3>
+      <p>
+        8 bit 线性编码只有 256 级，人眼对暗部的分辨力远高于 1/256，直接线性量化会在<strong>暗部出现明显色阶（banding）</strong>。
+        Gamma 编码的本质是<strong>把有限的码值按人眼的感知均匀性重新分配</strong>：暗部分到更多码值，亮部分到更少。
+        注意——它<strong>不是</strong>「为了匹配 CRT 的物理特性」这么简单，现代标准已经把感知均匀性作为设计目标写进定义。
+      </p>
+
+      <figure>
+        <svg viewBox="0 0 1140 320" role="img" aria-label="线性、gamma 2.2 与 sRGB 传递函数的对比曲线">
+          <g>
+            <!-- 坐标轴 -->
+            <line x1="70" y1="270" x2="470" y2="270" stroke="#26304f"></line>
+            <line x1="70" y1="40" x2="70" y2="270" stroke="#26304f"></line>
+            <text x="270" y="296" text-anchor="middle" fill="#7c88a8" font-size="11.5">线性光 L（0→1）</text>
+            <text x="58" y="46" text-anchor="end" fill="#7c88a8" font-size="11.5">码值 V</text>
+            <text x="58" y="274" text-anchor="end" fill="#7c88a8" font-size="11.5">0</text>
+            <text x="58" y="46" text-anchor="end" fill="#7c88a8" font-size="11.5">1</text>
+
+            <!-- 网格 -->
+            <g stroke="#1e2740" stroke-width="1" stroke-dasharray="3 4">
+              <line x1="70" y1="212" x2="470" y2="212"></line><line x1="70" y1="154" x2="470" y2="154"></line>
+              <line x1="70" y1="97" x2="470" y2="97"></line>
+              <line x1="150" y1="40" x2="150" y2="270"></line><line x1="230" y1="40" x2="230" y2="270"></line>
+              <line x1="310" y1="40" x2="310" y2="270"></line><line x1="390" y1="40" x2="390" y2="270"></line>
+            </g>
+
+            <!-- 线性：对角线 (0,270)->(470,40)，x=70+400L, y=270-230V -->
+            <line x1="70" y1="270" x2="470" y2="40" stroke="#7c88a8" stroke-width="1.6" stroke-dasharray="6 4"></line>
+
+            <!-- gamma2.2 采样点 (L:V)：0:0, .05:.256, .1:.351, .2:.481, .3:.578, .4:.659, .5:.730, .6:.793, .7:.850, .8:.904, .9:.953, 1:1 -->
+            <polyline fill="none" stroke="#4cc9f0" stroke-width="2.2"
+              points="70,270 90,211 110,189 150,159 190,137 230,118 270,102 310,88 350,76 390,62 430,51 470,40"></polyline>
+
+            <!-- sRGB 采样点：0:0, .05:.248, .1:.349, .2:.484, .3:.584, .4:.665, .5:.735, .6:.798, .7:.854, .8:.906, .9:.955, 1:1 -->
+            <polyline fill="none" stroke="#b57bff" stroke-width="2" stroke-dasharray="7 4"
+              points="70,270 90,213 110,190 150,159 190,136 230,117 270,101 310,86 350,74 390,62 430,50 470,40"></polyline>
+
+            <text x="300" y="150" fill="#7c88a8" font-size="11.5">线性 y=x</text>
+            <text x="106" y="88" fill="#4cc9f0" font-size="11.5">gamma 2.2</text>
+            <text x="106" y="108" fill="#b57bff" font-size="11.5">sRGB（分段）</text>
+
+            <text x="70" y="316" fill="#7c88a8" font-size="10.5">两条曲线在亮部几乎重合；差别集中在最暗的 4%。</text>
+          </g>
+
+          <g transform="translate(520,0)">
+            <text x="0" y="30" fill="#e8edf9" font-size="13" font-weight="700">sRGB 传递函数（IEC 61966-2-1）</text>
+            <text x="0" y="58" fill="#bfe9fb" font-size="12" font-family="ui-monospace, Consolas, monospace">V = 12.92·L　　　　　　　L ≤ 0.0031308</text>
+            <text x="0" y="80" fill="#bfe9fb" font-size="12" font-family="ui-monospace, Consolas, monospace">V = 1.055·L^(1/2.4) − 0.055　L &gt; 0.0031308</text>
+            <text x="0" y="108" fill="#aab6d4" font-size="11.5">反变换（解码）：L = V/12.92（V ≤ 0.04045），否则 ((V+0.055)/1.055)^2.4</text>
+
+            <text x="0" y="146" fill="#e8edf9" font-size="13" font-weight="700">BT.709 OETF（视频常用，和 sRGB 不是同一条）</text>
+            <text x="0" y="172" fill="#bfe9fb" font-size="12" font-family="ui-monospace, Consolas, monospace">V = 4.5·L　　　　　　　　L &lt; 0.018</text>
+            <text x="0" y="194" fill="#bfe9fb" font-size="12" font-family="ui-monospace, Consolas, monospace">V = 1.099·L^0.45 − 0.099　L ≥ 0.018</text>
+
+            <rect x="0" y="214" width="580" height="84" rx="10" fill="rgba(255,180,84,.07)" stroke="rgba(255,180,84,.35)"></rect>
+            <text x="16" y="238" fill="#ffb454" font-size="12" font-weight="700">坏味道：在 gamma 域做「物理」运算</text>
+            <text x="16" y="260" fill="#aab6d4" font-size="11.5">模糊、缩放、均值都要在线性域才是物理正确的；直接对 sRGB 码值做平均，</text>
+            <text x="16" y="280" fill="#aab6d4" font-size="11.5">会让边缘发暗（因为平均值偏小）。但工业界大量算法仍在 gamma 域做，</text>
+            <text x="16" y="300" fill="#aab6d4" font-size="11.5">因为它「看起来更符合直觉」——这也是一致性问题的来源之一。</text>
+          </g>
+        </svg>
+        <figcaption>图 6-1　Gamma 编码把码值按感知均匀性重分配；sRGB 与 BT.709 是两条不同的曲线，跨标准混用会造成暗部/饱和度的系统偏差。</figcaption>
+      </figure>
+
+      <div class="demo">
+        <div class="demo-title">演示 5 · Gamma 与位深：暗部层次是怎么丢的</div>
+        <p class="demo-hint">上排是同一场景在线性 / 感知域下的表现；下排是逐渐降低量化位深时的渐变带。拖动 gamma 与位深，看「banding」从哪里开始出现。</p>
+        <div class="demo-grid">
+          <canvas id="d5-canvas" height="340" aria-label="Gamma 与量化位深演示"></canvas>
+          <div class="ctrl">
+            <label>编码 gamma（1/γ）<b id="d5-gammav">2.20</b>
+              <input type="range" id="d5-gamma" min="1" max="3" step="0.05" value="2.2">
+            </label>
+            <label>量化位深<b id="d5-bitsv">8</b>
+              <input type="range" id="d5-bits" min="4" max="12" step="1" value="8">
+            </label>
+            <div class="readout" id="d5-readout">
+              <div><span>暗部 1% 分到的码值</span><span>—</span></div>
+              <div><span>最暗两级台阶的亮度差</span><span>—</span></div>
+              <div><span>可见 banding</span><span>—</span></div>
+            </div>
+            <p class="small muted" style="margin:0">这就是为什么 ISP 内部通常用 12–14 bit 处理、只在<strong>最后一步</strong>降到 8/10 bit 输出：中间每一步（增益、CCM）都会被量化误差再放大一次。</p>
+          </div>
+        </div>
+      </div>
+
+      <h3>6.3　色调映射与 HDR</h3>
+      <p>
+        Gamma 是一条<strong>固定曲线</strong>；而真实场景的动态范围可达 10⁴:1 以上，传感器的 12–14 bit 也远大于显示器的 8 bit。
+        把高动态范围压进可显示范围，就是<strong>色调映射（tone mapping）</strong>：全局曲线（Reinhard 等）便宜但会整体发灰，
+        局部算子（如基于梯度域/双边滤波的分解）能保住局部对比度但有光晕（halo）风险。
+        多帧 HDR（长短曝光合成）则在 ISP 里插在 RAW 校正之后、去马赛克之前或之后（取决于实现），
+        这就是为什么高端 ISP 的模块顺序会与「教科书顺序」略有出入。
+      </p>
+      <p class="small muted">
+        出处：IEC 61966-2-1:1999（sRGB）；ITU-R BT.709；Poynton, <em>Digital Video and HD: Algorithms and Interfaces</em>；Reinhard et al., "Photographic tone reproduction for digital images", SIGGRAPH 2002；Debevec &amp; Malik, "Recovering high dynamic range radiance maps from photographs", SIGGRAPH 1997；彩色成像综述 Sharma &amp; Trussell, "Digital color imaging", IEEE TIP 1997。
+      </p>
+    </section>
+
+    <!-- ================= 7 ================= -->
+    <section id="s7">
+      <h2><span class="num">07</span>YUV 域：人眼决定的重心</h2>
+      <p class="lead">
+        跨过 Gamma 之后，ISP 换了一套「价值观」：<strong>不再追求物理正确，而是追求人眼看着对、码率省</strong>。
+        RGB 三个通道是等权的；YUV 明确把「亮度」和「色度」拆开，因为人眼对色度的分辨力远低于亮度。
+      </p>
+
+      <h3>7.1　转换系数：601 与 709 别混用</h3>
+      <div class="formula">
+        <span class="lbl">式 7-1</span>
+        Y′ = 0.299·R′ + 0.587·G′ + 0.114·B′　　U = 0.492·(B′ − Y′)　　V = 0.877·(R′ − Y′)　　<span class="cm">（BT.601 / SD）</span>
+      </div>
+      <div class="formula">
+        <span class="lbl">式 7-2</span>
+        Y′ = 0.2126·R′ + 0.7152·G′ + 0.0722·B′　　Cb = (B′ − Y′)/1.8556　　Cr = (R′ − Y′)/1.5748　　<span class="cm">（BT.709 / HD）</span>
+      </div>
+
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>项目</th><th>BT.601</th><th>BT.709</th><th>容易踩的坑</th></tr></thead>
+          <tbody>
+            <tr><td>Y′ 权重 (R,G,B)</td><td>0.299 / 0.587 / 0.114</td><td>0.2126 / 0.7152 / 0.0722</td><td>用 601 的系数解 709 的流 → 颜色偏、饱和度错</td></tr>
+            <tr><td>取值范围</td><td colspan="2">limited / full（studio swing 16–235 与 full 0–255）</td><td>range 标错 → 画面发灰（对比度低）或高光/暗部被裁</td></tr>
+            <tr><td>色度采样</td><td colspan="2">4:4:4 / 4:2:2 / 4:2:0</td><td>4:2:0 把色度分辨率砍半（横竖各半）→ 彩色边缘变糊</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout warn">
+        <span class="t">Y′ 不是亮度（luminance）</span>
+        <p>
+          Y′ 是<strong>gamma 编码后的</strong>加权和，物理上的亮度（luminance，单位 cd/m²）是<strong>线性</strong>加权和。
+          两者只在「全白/全黑」处一致。所以：<strong>用 Y′ 算对比度、算照度、做 photometric 标定，都是错的</strong>——这是图像处理里最常见的物理错误之一。
+        </p>
+      </div>
+
+      <h3>7.2　在 YUV 上做的三件事</h3>
+      <div class="grid c3">
+        <div class="card">
+          <span class="tag">Y 通道</span>
+          <h4>锐化 / 边缘增强</h4>
+          <p>常用非锐化掩模（unsharp mask）：<code>Y′ + α·(Y′ − blur(Y′))</code>。α 就是「锐度」滑块。代价是<strong>过冲（overshoot/halo）</strong>：边缘两侧出现亮暗镶边，亚像素定位会被拉偏，工业测量场景必须关掉或严格限幅。</p>
+        </div>
+        <div class="card">
+          <span class="tag">UV 通道</span>
+          <h4>色度降噪（大胆压）</h4>
+          <p>人眼的色差对比敏感度低，所以 UV 可以做<strong>远强于 Y 的平滑</strong>而不被察觉。白平衡增益放大出来的色噪、去马赛克残留的伪彩，主要靠这一步收尾。代价是<strong>彩色边缘渗色</strong>（chroma bleeding）。</p>
+        </div>
+        <div class="card">
+          <span class="tag">编码前</span>
+          <h4>为压缩器让路</h4>
+          <p>4:2:0 直接丢 3/4 的色度样本；锐化产生的过冲会让高频码率飙升；时域降噪造成的拖影会被运动估计放大。所以<strong>ISP 的最后一段经常是「为编码器服务」</strong>，而不是为观感。</p>
+        </div>
+      </div>
+
+      <div class="callout ok">
+        <span class="t">顺序小结（背下来）</span>
+        <p><code>RAW降噪 → demosaic → AWB → CCM → gamma → RGB→YUV → Y 锐化 → UV 降噪</code>。左边每一步都在纠正「物理错误」，右边每一步都在做「感知取舍」。</p>
+      </div>
+
+      <h3>7.3　为什么 ISP 的 2D 滤波窗口都那么小</h3>
+      <p>
+        这是从硬件架构反推出来的一个「隐形约束」：ISP 是<strong>流式</strong>处理的，数据按行到达，片上只能缓存<strong>若干行</strong>（line buffer）。
+        所以绝大多数 ISP 的 2D 核只有 3×3 或 5×5，需要大窗口的算法（非局部均值、大核双边、引导滤波）必须改成<strong>分块 / 可分离 / 多级金字塔</strong>的实现，
+        或者干脆放到 NPU 上做后处理。这也解释了为什么<strong>去马赛克与 RAW 降噪的核普遍很小</strong>——不是算法界没想到更好的，是带宽与延迟不允许。
+      </p>
+    </section>
+
+    <!-- ================= 8 ================= -->
+    <section id="s8">
+      <h2><span class="num">08</span>3A 闭环：AE / AWB / AF</h2>
+      <p class="lead">
+        3A 不是数据通路上的模块，而是<strong>套在外面的三个控制回路</strong>：它们读「处理后的图」，调「传感器与镜头」。
+        所以 3A 的本质是<strong>控制论问题</strong>（收敛、超调、振荡），不是图像处理问题。
+      </p>
+
+      <figure>
+        <svg viewBox="0 0 1140 300" role="img" aria-label="3A 控制闭环：AE、AWB、AF 如何读取统计量并调整曝光、增益与对焦">
+          <defs>
+            <marker id="a4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="#3ddc97"></path>
+            </marker>
+          </defs>
+          <g>
+            <rect x="40" y="60" width="150" height="90" rx="12" fill="#16203c" stroke="#2b65a0"></rect>
+            <text x="115" y="88" text-anchor="middle" fill="#4cc9f0" font-size="13" font-weight="700">Sensor</text>
+            <text x="115" y="110" text-anchor="middle" fill="#aab6d4" font-size="11">曝光时间 / 模拟增益</text>
+            <text x="115" y="130" text-anchor="middle" fill="#aab6d4" font-size="11">HDR 合成模式</text>
+
+            <rect x="230" y="60" width="150" height="90" rx="12" fill="#16203c" stroke="#2b65a0"></rect>
+            <text x="305" y="88" text-anchor="middle" fill="#4cc9f0" font-size="13" font-weight="700">ISP 通路</text>
+            <text x="305" y="110" text-anchor="middle" fill="#aab6d4" font-size="11">RAW → YUV</text>
+            <text x="305" y="130" text-anchor="middle" fill="#aab6d4" font-size="11">（第 3–7 章的整条链）</text>
+
+            <rect x="420" y="60" width="160" height="90" rx="12" fill="#16203c" stroke="#3ddc97"></rect>
+            <text x="500" y="88" text-anchor="middle" fill="#3ddc97" font-size="13" font-weight="700">统计模块</text>
+            <text x="500" y="110" text-anchor="middle" fill="#aab6d4" font-size="11">直方图 / 分区均值 / 色度统计</text>
+            <text x="500" y="130" text-anchor="middle" fill="#aab6d4" font-size="11">锐度（对比度）测度</text>
+
+            <rect x="620" y="60" width="170" height="90" rx="12" fill="#1a1631" stroke="#b57bff"></rect>
+            <text x="705" y="84" text-anchor="middle" fill="#b57bff" font-size="13" font-weight="700">控制律</text>
+            <text x="705" y="106" text-anchor="middle" fill="#aab6d4" font-size="11">PI/PID · 爬山 · 阈值滞回</text>
+            <text x="705" y="126" text-anchor="middle" fill="#aab6d4" font-size="11">平滑 / 限速 / 场景切换检测</text>
+
+            <rect x="830" y="60" width="180" height="90" rx="12" fill="#1a1631" stroke="#b57bff"></rect>
+            <text x="920" y="84" text-anchor="middle" fill="#b57bff" font-size="13" font-weight="700">执行器</text>
+            <text x="920" y="106" text-anchor="middle" fill="#aab6d4" font-size="11">AE：曝光/增益　AWB：R/B 增益</text>
+            <text x="920" y="126" text-anchor="middle" fill="#aab6d4" font-size="11">AF：VCM 马达 / 液态镜头</text>
+
+            <g stroke="#3ddc97" stroke-width="1.6" marker-end="url(#a4)">
+              <line x1="190" y1="105" x2="226" y2="105"></line>
+              <line x1="380" y1="105" x2="416" y2="105"></line>
+              <line x1="580" y1="105" x2="616" y2="105"></line>
+              <line x1="790" y1="105" x2="826" y2="105"></line>
+            </g>
+
+            <!-- 反馈回路 -->
+            <path d="M 920 150 L 920 220 L 115 220 L 115 154" fill="none" stroke="#ffb454" stroke-width="1.6" stroke-dasharray="7 5" marker-end="url(#ar2)"></path>
+            <text x="520" y="242" text-anchor="middle" fill="#ffb454" font-size="12" font-weight="700">反馈：下一帧生效（存在 1 帧以上延迟，所以必须预测/阻尼）</text>
+
+            <text x="40" y="290" fill="#7c88a8" font-size="11.5">三个回路互相耦合：AE 一动，AWB 要重新收敛；AF 一动，暗角与色差都变，锐度统计量也随之变。</text>
+            <text x="640" y="290" fill="#7c88a8" font-size="11.5">工程上最常见的 bug 不是算法差，而是「三个环同时抢同一帧的统计量」。</text>
+          </g>
+        </svg>
+        <figcaption>图 8-1　3A 是三个并联的反馈环，执行器在传感器/镜头上，观测器在 ISP 输出上。延迟与耦合是主要难点。</figcaption>
+      </figure>
+
+      <h3>8.1　AE：在「曝光时间」与「增益」之间选</h3>
+      <p>
+        AE 的目标通常是让画面的某个统计量（平均亮度、或分区加权的亮度）落在<strong>目标灰</strong>附近——常见做法是把 18% 反射率灰卡映射到约 118–122/255（sRGB 下的中灰），
+        而不是 128。执行上有两个自由度：<strong>曝光时间</strong>与<strong>增益</strong>，二者都能提亮，但质量完全不同：
+      </p>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>手段</th><th>提亮效果</th><th>代价</th><th>优先用于</th></tr></thead>
+          <tbody>
+            <tr><td>延长曝光时间</td><td>线性提亮</td><td>运动模糊；长曝光热点（hot pixel）增加；可能触发闪烁</td><td>静止场景优先</td></tr>
+            <tr><td>提高模拟增益</td><td>线性提亮</td><td>噪声同比放大，动态范围缩小（高光更早饱和）</td><td>曝光已达上限（快门上限/防抖极限）</td></tr>
+            <tr><td>提高数字增益</td><td>只是乘一个数</td><td>纯放大已有噪声，无信息增益</td><td>仅用于预览/低光兜底</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="callout">
+        <span class="t">防闪烁（anti-flicker）</span>
+        <p>
+          在 50/60 Hz 交流光源下，曝光时间跨过光源周期就会出现<strong>滚动明暗条带</strong>。标准做法是把曝光时间量化到光源半周期的整数倍
+          （50 Hz → 10 ms 的倍数；60 Hz → 8.33 ms 的倍数），代价是低光下要么欠曝、要么被迫提增益。这是手机在室内拍照噪点明显偏高的常见原因之一（工程经验）。
+        </p>
+      </div>
+
+      <h3>8.2　AWB 与 AF</h3>
+      <p>
+        <strong>AWB</strong> 在第 5 章已讲透，这里只补闭环特性：它必须<strong>读「AWB 之前或之后」的统计量</strong>（不同厂商不同）、
+        对增益做<strong>时域平滑</strong>、并检测「画面主体变了」（场景切换）以便快速重置，否则会出现「走出室内颜色慢慢扫过去」的观感。
+      </p>
+      <p>
+        <strong>AF</strong> 有三条技术路线：<strong>反差式（CDAF）</strong>用「爬山法」最大化锐度统计量——慢、可能拉风箱（hunting），但不需要额外硬件；
+        <strong>相位式（PDAF）</strong>在像素里埋半遮蔽结构，直接测离焦方向与量——快，但低光/低纹理下失效；
+        <strong>激光/ToF 辅助</strong>提供绝对距离——近距离可靠，远距离与透玻璃场景失效。手机基本都是三者融合。
+      </p>
+      <p class="small muted">
+        出处：AE 的对照度与目标灰映射见 Poynton（同上）与各平台 ISP 文档；防闪烁量化规则为行业通行做法（工程经验，非标准）；PDAF 原理见各 sensor 厂商公开资料；反差式 AF 的爬山/搜索策略见 Brill, "Automatic exposure control" 等相关文献与相机工程资料。<strong>具体参数范围因平台而异</strong>。
+      </p>
+    </section>
+
+    <!-- ================= 9 ================= -->
+    <section id="s9">
+      <h2><span class="num">09</span>工程实践：RAW 还是 YUV</h2>
+      <p class="lead">
+        前面八章讲的是「管线长什么样」，这一章讲「你该怎么用它」。最实际的一个问题是：
+        <strong>做算法时，我该从哪一段取数据？</strong>
+      </p>
+
+      <div class="demo">
+        <div class="demo-title">演示 6 · 逐级对比：跳过这一步会看到什么</div>
+        <p class="demo-hint">点上面的阶段名切换「当前级」，左半是正常输出，右半是<strong>把这一级跳过</strong>的结果。滑块是该级的关键参数。这是理解「为什么必须有这一步」最快的方式。</p>
+        <div class="stage-picker" id="d6-stages">
+          <button data-stage="blc" class="on">黑电平 BLC</button>
+          <button data-stage="lsc">暗角 LSC</button>
+          <button data-stage="dpc">坏点 DPCC</button>
+          <button data-stage="demosaic">去马赛克</button>
+          <button data-stage="awb">白平衡</button>
+          <button data-stage="ccm">CCM</button>
+          <button data-stage="gamma">Gamma</button>
+          <button data-stage="sharp">锐化</button>
+        </div>
+        <div class="demo-grid">
+          <canvas id="d6-canvas" height="330" aria-label="逐级跳过对比演示"></canvas>
+          <div class="ctrl">
+            <label>该级参数<b id="d6-paramv">—</b>
+              <input type="range" id="d6-param" min="0" max="100" step="1" value="50">
+            </label>
+            <div class="readout" id="d6-readout">
+              <div><span>当前级</span><span>—</span></div>
+              <div><span>作用域</span><span>—</span></div>
+              <div><span>跳过后果</span><span>—</span></div>
+            </div>
+            <p class="small muted" style="margin:0">左 = 正常，右 = 跳过。特别注意 <strong>去马赛克</strong> 与 <strong>CCM</strong>：它们的缺失不是「暗一点/淡一点」，而是结构性的错误。</p>
+          </div>
+        </div>
+      </div>
+
+      <h3>9.1　取数位置的选择</h3>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>取数位置</th><th>好处</th><th>代价</th><th>适合</th></tr></thead>
+          <tbody>
+            <tr><td>RAW（Bayer，10–14 bit）</td><td>信息最全、线性、无 demosaic 伪彩、无厂商锐化/降噪干预、多相机一致性好</td><td>需要自己做 BLC/LSC/demosaic；1 通道或拆 3 平面、数据量 2–3 倍；没有预训练模型</td><td>工业检测、多目一致性要求高、暗部/微小缺陷场景</td></tr>
+            <tr><td>YUV（8/10 bit，4:2:0）</td><td>生态最成熟、OpenCV/模型开箱可用、带宽小</td><td>受 ISP tuning 影响；锐化会让边缘定位漂移；色度已被砍半；多相机之间可能不一致</td><td>绝大多数视觉任务、检测/分类、实时性优先</td></tr>
+            <tr><td>RGB（ISP 内部或 4:4:4）</td><td>比 YUV 少了色度丢采样</td><td>很多平台不开放这个节点；带宽大</td><td>需要精确颜色测量（配合色卡与固定 AWB）</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout bad">
+        <span class="t">工业/车载的血泪经验</span>
+        <p>
+          如果算法依赖<strong>颜色阈值、亚像素边缘、微小缺陷、暗部纹理</strong>——那么 ISP 的自动 AWB、自动曝光、锐化、时域降噪都会让结果<strong>不可复现</strong>。
+          工程上成本最低的做法不是「迁到 RAW」，而是<strong>把 ISP 参数锁死</strong>：关闭自动 AWB/AE（或锁定在当前值）、固定 gamma 曲线、关闭锐化、关闭时域降噪，
+          再用色卡与灰卡验证一致性。这比改数据链路便宜得多，收益通常也够。
+        </p>
+      </div>
+
+      <h3>9.2　训练与部署的一致性检查清单</h3>
+      <div class="grid c2">
+        <div class="card">
+          <h4>上线前必须逐条确认</h4>
+          <ul class="small">
+            <li>训练数据与推理数据是否来自<strong>同一颗 sensor + 同一版 ISP 固件</strong>？</li>
+            <li>AWB/AE 是否<strong>锁定</strong>？锁定值是否与训练时一致？</li>
+            <li>gamma 曲线、CCM、LSC 是否在训练后被<strong>重新 tuning</strong>过？</li>
+            <li>锐化/降噪的强度是否一致？（会直接改变边缘响应）</li>
+            <li>色彩空间与 range（full / limited）是否一致？</li>
+            <li>是否经过<strong>压缩</strong>（JPEG/H.264）？质量参数是否一致？</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h4>bring-up 阶段最常见的 6 个错误</h4>
+          <ul class="small">
+            <li><strong>Bayer 相位读错</strong> → 红蓝互换，肤色发青</li>
+            <li><strong>黑电平用错增益档</strong> → 暗部发灰或发紫</li>
+            <li><strong>LSC 标定条件不对</strong>（光圈/焦距/对焦距离变了）→ 四角色偏</li>
+            <li><strong>AWB 与 CCM 顺序颠倒</strong> → 偏色收不回</li>
+            <li><strong>在 gamma 域做线性运算</strong> → 边缘发暗、均值偏小</li>
+            <li><strong>AE/AWB 增益未平滑</strong> → 画面周期性「呼吸」</li>
+          </ul>
+        </div>
+      </div>
+
+      <h3>9.3　一句话总结每个模块存在的理由</h3>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>模块</th><th>它修的是什么「错误」</th><th>不做的直接后果</th></tr></thead>
+          <tbody>
+            <tr><td>BLC</td><td>零点偏移</td><td>黑不黑；后续所有乘法语义错</td></tr>
+            <tr><td>LSC</td><td>空间不均匀（亮度 + 色度）</td><td>四角暗、四角色偏；与阈值类算法冲突</td></tr>
+            <tr><td>DPCC</td><td>固定/漂移坏点</td><td>单像素亮点被插值扩散成彩色斑</td></tr>
+            <tr><td>RAW NR</td><td>与信号相关的噪声</td><td>demosaic 把噪声当细节放大</td></tr>
+            <tr><td>Demosaic</td><td>颜色欠采样</td><td>只有 1/3 的颜色；直接显示是灰度马赛克</td></tr>
+            <tr><td>AWB</td><td>光源色偏</td><td>整幅图偏色，白不是白</td></tr>
+            <tr><td>CCM</td><td>传感器光谱响应 ≠ 人眼</td><td>颜色"能看出是什么"但"不对"，红发橙、肤色发黄</td></tr>
+            <tr><td>Gamma</td><td>码值与感知非线性</td><td>暗部糊成一片或出现色阶</td></tr>
+            <tr><td>Y 锐化 / UV 降噪</td><td>感知上的清晰度与色噪</td><td>糊、色噪明显（观感问题，非物理错误）</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ================= 10 ================= -->
+    <section id="s10">
+      <h2><span class="num">10</span>速查表、自测与出处</h2>
+
+      <h3>10.1　一页速查</h3>
+      <div class="formula">
+        <span class="lbl">管线</span>
+        光子 → 镜头(PSF/暗角) → CFA → 光电转换(散粒噪声) → ADC(+黑电平) → BLC → LSC → DPCC → RAW NR → Demosaic → AWB → CCM → Gamma/TM<br>
+        → RGB→YUV → Y 锐化 → UV 降噪 → 4:2:0 输出
+      </div>
+      <div class="formula">
+        <span class="lbl">域</span>
+        线性域：BLC / LSC / DPCC / RAW NR / Demosaic / AWB / CCM　│　感知域：Gamma / tone mapping / YUV / 锐化 / 色度降噪
+      </div>
+      <div class="formula">
+        <span class="lbl">四个「必须」</span>
+        BLC 必须在所有乘法之前　│　坏点校正必须在 demosaic 之前　│　AWB 必须在 CCM 之前　│　CCM 必须在 Gamma 之前
+      </div>
+
+      <h3>10.2　自测（6 题）</h3>
+      <p class="small muted">点击选项立即判分并展开解析。</p>
+      <div id="quiz">
+        <div class="quiz-item" data-q="1">
+          <div class="q">1. 为什么坏点校正（DPCC）必须放在去马赛克之前？</div>
+          <div class="opts">
+            <div class="opt" data-k="a">A. 因为去马赛克之后就没有单通道数据了，无法定位坏点</div>
+            <div class="opt" data-k="b">B. 因为去马赛克会把单像素错误插值扩散到邻域，变成彩色斑块</div>
+            <div class="opt" data-k="c">C. 因为坏点校正需要 gamma 之后的码值</div>
+          </div>
+          <div class="exp"><strong>B。</strong>坏点本身只是一个像素的错误；但 demosaic 会用它的邻域加权重建三个通道，错误因此被复制成一片彩色伪影，而且此后再也无法区分「原本的坏点」与「插值产生的错误」。A 的说法不对——去马赛克后仍可检测坏点，只是无法在不伤害插值结果的前提下修复。</div>
+        </div>
+
+        <div class="quiz-item" data-q="2">
+          <div class="q">2. AWB 与 CCM 的顺序为什么不能反？</div>
+          <div class="opts">
+            <div class="opt" data-k="a">A. CCM 是按「已白平衡到某白点」的假设标定的，顺序反了等于在错的坐标系里变换</div>
+            <div class="opt" data-k="b">B. 因为 AWB 只能在 gamma 之后做</div>
+            <div class="opt" data-k="c">C. 顺序其实可以随便，只要系数一起重标定</div>
+          </div>
+          <div class="exp"><strong>A。</strong>CCM 的目标是「把相机 RGB 映射到标准空间」，这个映射的前提是中性的像素已经中性。先 CCM 再 AWB，相当于把白平衡的增益乘在了一个已经混合过的颜色上，偏色无法用单通道增益修正。（C 之所以错：即便重标定，AWB 的「中性」假设也必须在 CCM 之前成立，否则矩阵会把偏色混合进所有通道。）</div>
+        </div>
+
+        <div class="quiz-item" data-q="3">
+          <div class="q">3. Malvar-He-Cutler 的去马赛克核，本质改进是什么？</div>
+          <div class="opts">
+            <div class="opt" data-k="a">A. 用了更大的窗口做平均，所以更平滑</div>
+            <div class="opt" data-k="b">B. 把「已知通道的高频 ≈ 缺失通道的高频」写成线性修正项，而不是单纯插值</div>
+            <div class="opt" data-k="c">C. 引入了神经网络学习先验</div>
+          </div>
+          <div class="exp"><strong>B。</strong>它是线性滤波，但核的设计来自「颜色差恒定 + 高频共享」的假设：中心项保留本像素高频，±2 项借邻域同色通道，−1 项抵消低频。所以它在平坦区近似「取最近邻」，在边缘处才修正——比双线性准，但仍是线性，无法真正自适应方向。</div>
+        </div>
+
+        <div class="quiz-item" data-q="4">
+          <div class="q">4. 4:2:0 只砍色度采样，依据是什么？</div>
+          <div class="opts">
+            <div class="opt" data-k="a">A. 人眼对色度的空间分辨力低于亮度</div>
+            <div class="opt" data-k="b">B. 色度通道的数据类型更小</div>
+            <div class="opt" data-k="c">C. 因为 YUV 的色度本来就是低频的，砍了不会丢信息</div>
+          </div>
+          <div class="exp"><strong>A。</strong>依据是人眼的色差对比敏感度（chromatic CSF）在空间频率上衰减得比亮度快。注意 C 是常见误解：色度<em>可以</em>含高频（彩色边缘），4:2:0 会把它糊掉，所以彩色边缘会出现渗色——这是有损的，只是人眼不那么敏感。</div>
+        </div>
+
+        <div class="quiz-item" data-q="5">
+          <div class="q">5. 「高 ISO 噪点多」的最准确解释是？</div>
+          <div class="opts">
+            <div class="opt" data-k="a">A. 提高增益会凭空产生噪声</div>
+            <div class="opt" data-k="b">B. 增益把原本就存在的暗部噪声一起放大，同时让高光更早饱和、动态范围变窄</div>
+            <div class="opt" data-k="c">C. 因为 ISO 越高，传感器的量子效率越低</div>
+          </div>
+          <div class="exp"><strong>B。</strong>噪声（散粒 + 读出）在增益之前就存在。模拟增益是「信号与噪声一起乘」，所以 SNR 并不会因为增益变好；而增益之后 ADC 的动态范围被压缩，高光更容易裁切。真正提升 SNR 的只有「收集更多光子」（更长曝光 / 更大光圈 / 更大像素）。</div>
+        </div>
+
+        <div class="quiz-item" data-q="6">
+          <div class="q">6. 暗角校正（LSC）最容易被忽视的副作用是？</div>
+          <div class="opts">
+            <div class="opt" data-k="a">A. 会让画面整体变亮</div>
+            <div class="opt" data-k="b">B. 乘增益会同比放大边角噪声，四角方差按 G² 增长</div>
+            <div class="opt" data-k="c">C. 会改变白平衡</div>
+          </div>
+          <div class="exp"><strong>B。</strong>σ_out = G·σ_in，所以四角补 4 倍时噪声标准差也 ×4、方差 ×16。这是「边角看起来更脏」的数学原因。C 不完全错——LSC 是逐通道的，若标定不准则会残留色偏，但那是标定问题，不是校正本身的必然副作用。</div>
+        </div>
+
+        <p class="small">
+          <button class="btn" id="quiz-reset">重置全部答案</button>
+          <span class="muted" id="quiz-score" style="margin-left:12px">已答 0 / 6　正确 0</span>
+        </p>
+      </div>
+
+      <h3>10.3　出处与延伸</h3>
+      <div class="grid c2">
+        <div class="card">
+          <h4>一手文献 / 标准</h4>
+          <ul class="small">
+            <li>Bayer, B. E. <em>Color imaging array</em>. US Patent 3,971,065 (1976).</li>
+            <li>Hamilton, J. F. &amp; Adams, J. E. <em>Adaptive color plane interpolation in single sensor color electronic camera</em>. US Patent 5,629,734 (1997).</li>
+            <li>Malvar, H. S., He, L., Cutler, R. <em>High-quality linear interpolation for demosaicing of Bayer-patterned color images</em>. ICASSP 2004.</li>
+            <li>Zhang, L. &amp; Wu, X. <em>Color demosaicking via directional linear minimum mean square-error estimation</em>. IEEE TIP, 2005.</li>
+            <li>Buchsbaum, G. <em>A spatial processor model for object colour perception</em>. J. Franklin Inst., 1980.</li>
+            <li>Land, E. H. <em>The Retinex theory of color vision</em>. Scientific American, 1977.</li>
+            <li>Finlayson, G. D., Hordley, S. D., Hubel, P. M. <em>Color by correlation</em>. ICCV 2001.</li>
+            <li>Finlayson, G. D. &amp; Trezzi, E. <em>Shades of gray and colour constancy</em>. CIC 2004.</li>
+            <li>IEC 61966-2-1:1999（sRGB）; ITU-R BT.709（HD 视频参数）; ITU-R BT.601（SD）。</li>
+            <li>Sharma, G. &amp; Trussell, H. J. <em>Digital color imaging</em>. IEEE TIP, 1997.</li>
+            <li>Ramanath, R., Snyder, W. E., Bilbro, G. L., Sander, W. A. <em>Demosaicking methods for Bayer color arrays</em>. JEI, 2002.</li>
+            <li>Janesick, J. <em>Photon Transfer</em>. SPIE Press, 2007（噪声模型与 PTC）。</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h4>二手资料（结构参考，未逐条核对）</h4>
+          <ul class="small">
+            <li>ARM, <em>Mali-C71 ISP white paper</em>（ISP 模块划分与硬件约束）</li>
+            <li>Qualcomm Spectra ISP 公开资料（手机 ISP 功能集合）</li>
+            <li><a href="https://en.wikipedia.org/wiki/Image_processing_pipeline">Wikipedia: Image processing pipeline</a></li>
+            <li><a href="https://en.wikipedia.org/wiki/Color_filter_array">Wikipedia: Color filter array</a></li>
+            <li>知乎专栏 <code>c_1389227246742335488</code>——<strong>未能核对</strong>：该专栏与文章对未登录抓取返回 403，本页未引用其内容。</li>
+          </ul>
+          <div class="callout warn" style="margin-top:14px">
+            <span class="t">关于可信度分层</span>
+            <p class="small">本页把内容分成三类：<strong>标准/论文结论</strong>（可查原文）、<strong>量级/工程惯例</strong>（已标注，不同平台不同）、<strong>本页的演示</strong>（本页自己生成的合成图像，用于说明机理，不代表真实 sensor 数据）。</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- SECTIONS-END -->
+
+    <footer class="site">
+      <p>
+        本页所有示意图与演示图像均在本地生成（Canvas / 内联 SVG），不加载任何外部资源，可离线双击打开。
+        事实性内容以章末出处为准；标注「工程经验」的段落是业界通行做法而非标准规定，不同平台参数不同。
+      </p>
+      <p class="muted small">
+        相关材料：<a href="../rcnn/index.html">R-CNN 逐步详解</a>　·　
+        <a href="../../interview-questions/03-opencv-isp.md">面试题 · OpenCV 与 ISP/3A</a>　·　
+        <a href="../../图像处理面试150题.md">图像处理面试 150 题</a>
+      </p>
+    </footer>
+  </main>
+</div>
+
+<script src="../assets/site.js"></script>
+<script src="../assets/isp.js"></script>
+</body>
+</html>
